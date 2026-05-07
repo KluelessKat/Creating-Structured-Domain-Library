@@ -1,8 +1,10 @@
 library(tidyverse)
 
 #File Pathnames. Change them to match yours.
-input <- "/Users/joseparedes/Desktop/kappelLab/structuredDomainLibrary/4_domainLibraryPhysicalProperties.tsv"
-output <- "/Users/joseparedes/Desktop/kappelLab/structuredDomainLibrary/5_finalCandidateSequences.tsv"
+input <- '/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/jpl_exampleLibraryFiles/4_domainLibraryPhysicalProperties_jpl.tsv'
+#'/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/04282026_metapredict/4_domainLibraryPhysicalProperties_meta.tsv'
+output <- '/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/jpl_exampleLibraryFiles/5_finalCandidateSequences_jpl2.tsv'
+#'/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/04282026_metapredict/5_finalCandidateSequences_meta.tsv'
 df <- read_tsv(input, na=c("", "NA"))
 
 #Ensure columns holding metrics are numeric
@@ -52,6 +54,7 @@ aromaticPlot <- ggplot(dfPlot, aes(x=interactionIndex, y=aromaticSurfaceFraction
     color="Fraction Buried",
     size="Rg (Å)")+
   theme_minimal(base_size=14)
+pdf(file.path(dirname(output), "Rplots.pdf"))
 print(aromaticPlot)
 
 #Visualize how many sequences influence condensation through charge interactions
@@ -108,6 +111,7 @@ candidatesPlot <- ggplot(dfPlot, aes(x=interactionIndex, y=aromaticSurfaceFracti
     color="Driver Class")+
   theme_minimal(base_size=14)
 print(candidatesPlot)
+dev.off()
 
 #Save the final candidate sequences
 finalCandidateSequences <- dfPlot %>%

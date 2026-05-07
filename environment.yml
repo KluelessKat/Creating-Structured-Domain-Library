@@ -1,0 +1,100 @@
+# ============================================================================
+# Creating-Structured-Domain-Library — conda environment spec
+# ============================================================================
+#
+# One-command setup:
+#     conda env create -f environment.yml
+#     conda activate domainlib
+#
+# To update an existing env after editing this file:
+#     conda env update -f environment.yml --prune
+#
+# To remove it entirely and start over:
+#     conda deactivate
+#     conda env remove -n domainlib
+#
+# What this installs:
+#   - conda packages  -> numerics + packages with compiled components (pytorch,
+#                        freesasa, pymol) that are painful to install via pip
+#   - pip packages    -> everything that only exists on PyPI (metapredict,
+#                        neurosnap) plus the pure-Python utilities
+#
+# What it does NOT install (manual steps required — see bottom of file):
+#   - AIUPred  (needed for step 2 aiupred variant only)
+# ============================================================================
+
+name: domainlib
+
+channels:
+  - conda-forge
+  - bioconda
+  - pytorch
+
+dependencies:
+  # ----- Python itself -------------------------------------------------------
+  - python=3.11
+
+  # ----- Numerics / ML stack (install via conda to keep ABIs consistent) -----
+  # metapredict's docs warn that mixing pip and conda numpy/pytorch on macOS
+  # produces binary incompatibilities. Installing them here via conda prevents
+  # the issue.
+  - numpy
+  - scipy
+  - pytorch
+  - cython
+  - matplotlib
+
+  # ----- Structural biology (conda is more reliable than pip for these) ------
+  - biopython            # step 3: from Bio import PDB
+  - freesasa             # steps 3 & 4: SASA calculations
+
+  # ----- Image handling ------------------------------------------------------
+  - pillow               # step 6: image tiling
+
+  # ----- HTTP + I/O ----------------------------------------------------------
+  - requests             # step 3: AlphaFoldDB downloads
+
+  # ----- Data + Excel --------------------------------------------------------
+  - pandas
+  - openpyxl             # compare_domain_libraries.py Excel output
+
+  # ----- PyMOL (open-source build, conda-only) -------------------------------
+  # Only required for step 6 (image generation). If you don't run step 6,
+  # you can comment this out to keep the env smaller.
+  - pymol-open-source
+
+  # ----- pip-only packages ---------------------------------------------------
+  - pip
+  - pip:
+    # metapredict: disorder predictor — step 2 (metapredict variant)
+    - metapredict>=3.0
+
+    # neurosnap: radius of gyration / structure utilities — step 4
+    # If the PyPI release is out of date relative to GitHub, swap the line
+    # below for the git URL shown underneath.
+    - neurosnap
+    # - git+https://github.com/NeurosnapInc/neurosnap.git
+
+
+# ============================================================================
+# Manual installs (NOT handled by `conda env create`)
+# ============================================================================
+#
+# AIUPred
+# --------------------------------------------------------------------
+# Only needed if you run 2_disorderedPredictions_aiupred.py.
+# AIUPred is free for academic use but is not distributed on PyPI or conda.
+# Request the downloadable package from https://aiupred.elte.hu/ and follow
+# their README to register it with Python inside this conda environment.
+#
+# Your script uses `from aiupred import AIUPred` (the newer API). Older
+# releases exposed `aiupred_lib` instead (see the commented-out code in your
+# script). Make sure the version you download matches the import your script
+# expects.
+#
+# ============================================================================
+# Step 5 is an R script (5_obtainFinalCandidateSequences.R), not Python — its
+# dependencies live in R, not in this file. Install R separately (for example,
+# `brew install r` on macOS) and handle R packages via install.packages()
+# inside R or via `r-base` + `r-<pkg>` entries in a separate conda env.
+# ============================================================================

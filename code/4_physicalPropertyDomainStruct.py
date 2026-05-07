@@ -1,15 +1,22 @@
 import numpy as np
-from neurosnap.protein import * #https://neurosnap.ai/blog/post/understanding-the-radius-of-gyration-in-protein-design-bioinformatics/66fb0ecc5a941760bf4b5138
+#from neurosnap.protein import * #https://neurosnap.ai/blog/post/understanding-the-radius-of-gyration-in-protein-design-bioinformatics/66fb0ecc5a941760bf4b5138
 import freesasa
+import pandas as pd
 import os
+from neurosnap.io.pdb import parse_pdb
 
 def calcRg(pdbFile):
-    '''Calculate the radius of gyration for a given structure, reflecting how compact it is.'''
+    ensemble = parse_pdb(pdbFile, return_type="ensemble")
+    structure = ensemble.first()
+    return structure.calculate_rog()
 
-    structure=Protein(pdbFile)
-    distances_from_com=structure.distances_from_com()  
-    Rg=np.sqrt(np.sum(distances_from_com**2)/len(distances_from_com))
-    return Rg #In Å
+# def calcRg(pdbFile):
+#     '''Calculate the radius of gyration for a given structure, reflecting how compact it is.'''
+
+#     structure = Protein(pdbFile)
+#     distances_from_com=structure.distances_from_com()  
+#     Rg=np.sqrt(np.sum(distances_from_com**2)/len(distances_from_com))
+#     return Rg #In Å
 
 def calcSASAMetrics(pdbFile, SASACutoff):
     '''Calculates the surface properties of a given structure by looking at types of surface residues'''
@@ -46,11 +53,13 @@ def calcSASAMetrics(pdbFile, SASACutoff):
     return metrics
 
 
-pdbFileDir="/Users/joseparedes/Desktop/kappelLab/alphaFold/dbFiles" #Specify where your domain PDB files are stored (should be a folder)
+pdbFileDir="/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/alphaFold/dbFiles" #Specify where your domain PDB files are stored (should be a folder)
 
 #File Pathnames. Change them to match yours.  
-input='/Users/joseparedes/Desktop/kappelLab/structuredDomainLibrary/3_domainLibraryInteractions.tsv'
-output='/Users/joseparedes/Desktop/kappelLab/structuredDomainLibrary/4_domainLibraryPhysicalProperties.tsv'
+input= \
+'/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/04282026_metapredict/3_domainLibraryInteractions_meta.tsv'
+output= \
+'/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/04282026_metapredict/4_domainLibraryPhysicalProperties_meta.tsv'
 
 #Prepare a dataframe to store physical properties for domain sequences
 df=pd.read_csv(input, sep="\t")
@@ -61,7 +70,7 @@ df["positiveSurfaceFraction"]=None
 df["negativeSurfaceFraction"]=None
 
 for idx, sequence in df.iterrows():#Go through each domain sequence and calculate physical properties
-    pdbFile=f"/Users/joseparedes/Desktop/kappelLab/alphaFold/dbFiles/{sequence["Entry"]}_domain_model.pdb"
+    pdbFile=f"/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/alphaFold/dbFiles/{sequence['Entry']}_domain_model.pdb"
     if not os.path.exists(pdbFile):#If there is no PDB file for the domain, move onto the next sequence
         continue
     

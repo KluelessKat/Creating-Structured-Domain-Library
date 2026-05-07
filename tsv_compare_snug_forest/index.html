@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Snug Forest · Gene & Domain Diff</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-inner">
+      <svg class="logo" viewBox="0 0 64 64" aria-hidden="true">
+        <!-- Soft Totoro silhouette -->
+        <ellipse cx="32" cy="38" rx="22" ry="24" fill="#5e6f5a" />
+        <ellipse cx="32" cy="44" rx="16" ry="14" fill="#e9e1cb" />
+        <path d="M14 18 Q18 6 24 14" stroke="#5e6f5a" stroke-width="3" fill="none" stroke-linecap="round" />
+        <path d="M50 18 Q46 6 40 14" stroke="#5e6f5a" stroke-width="3" fill="none" stroke-linecap="round" />
+        <circle cx="25" cy="32" r="2.4" fill="#2a2a2a" />
+        <circle cx="39" cy="32" r="2.4" fill="#2a2a2a" />
+        <circle cx="25.6" cy="31.4" r="0.7" fill="#fff" />
+        <circle cx="39.6" cy="31.4" r="0.7" fill="#fff" />
+        <path d="M28 40 Q32 43 36 40" stroke="#2a2a2a" stroke-width="1.4" fill="none" stroke-linecap="round" />
+      </svg>
+      <div class="title-block">
+        <h1>Snug Forest</h1>
+        <p class="subtitle">A gentle place to compare genes and their domains.</p>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- ============================== Crash page ============================== -->
+    <section id="crash" class="crash" aria-label="File loader">
+      <div class="dropzones">
+        <div class="dropzone" data-side="before">
+          <div class="dz-stripe stripe-dust"></div>
+          <div class="dz-label">Before</div>
+          <div class="dz-hint">Drop a TSV or CSV here<br /><span class="dz-sub">or click to browse</span></div>
+          <div class="dz-status" data-role="status"></div>
+          <div class="dz-error" data-role="error"></div>
+          <input type="file" data-role="file-input" accept=".tsv,.csv,text/tab-separated-values,text/csv" hidden />
+        </div>
+
+        <div class="dropzone" data-side="after">
+          <div class="dz-stripe stripe-sky"></div>
+          <div class="dz-label">After</div>
+          <div class="dz-hint">Drop a TSV or CSV here<br /><span class="dz-sub">or click to browse</span></div>
+          <div class="dz-status" data-role="status"></div>
+          <div class="dz-error" data-role="error"></div>
+          <input type="file" data-role="file-input" accept=".tsv,.csv,text/tab-separated-values,text/csv" hidden />
+        </div>
+      </div>
+
+      <div class="analyze-row">
+        <button id="analyze-btn" class="btn btn-cta" disabled>Analyze</button>
+      </div>
+    </section>
+
+    <!-- ============================== Results ============================== -->
+    <section id="results" class="results hidden" aria-label="Results">
+
+      <!-- Q1 -->
+      <section class="result-section">
+        <div class="section-head">
+          <h2>1. Genes added &amp; removed</h2>
+          <p class="section-sub">Comparing the set of gene names in each file.</p>
+          <div class="section-controls">
+            <label class="ctrl">
+              <span>Sort</span>
+              <select id="q1-sort">
+                <option value="asc">A → Z</option>
+                <option value="desc">Z → A</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <div class="tri-grid" id="q1-grid">
+          <div class="tri-col" data-bucket="onlyBefore">
+            <div class="tri-stripe stripe-dust"></div>
+            <div class="tri-head">
+              <div class="tri-title">Only in Before <span class="tri-count" data-role="count">0</span></div>
+              <input class="tri-search" type="search" placeholder="Search genes…" data-role="search" />
+              <div class="tri-filter" data-role="filter">
+                <button class="filter-toggle" data-role="filter-toggle" type="button">Filter by domain type</button>
+                <div class="filter-panel hidden" data-role="filter-panel">
+                  <input type="search" class="filter-search" placeholder="Find domain types…" data-role="filter-search" />
+                  <div class="filter-options" data-role="filter-options"></div>
+                  <div class="filter-actions">
+                    <button class="btn btn-ghost btn-sm" type="button" data-role="filter-clear">Clear</button>
+                    <button class="btn btn-sm" type="button" data-role="filter-close">Done</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <ul class="tri-list" data-role="list"></ul>
+          </div>
+
+          <div class="tri-col" data-bucket="both">
+            <div class="tri-stripe stripe-moss"></div>
+            <div class="tri-head">
+              <div class="tri-title">In Both <span class="tri-count" data-role="count">0</span></div>
+              <input class="tri-search" type="search" placeholder="Search genes…" data-role="search" />
+              <div class="tri-filter" data-role="filter">
+                <button class="filter-toggle" data-role="filter-toggle" type="button">Filter by domain type</button>
+                <div class="filter-panel hidden" data-role="filter-panel">
+                  <input type="search" class="filter-search" placeholder="Find domain types…" data-role="filter-search" />
+                  <div class="filter-options" data-role="filter-options"></div>
+                  <div class="filter-actions">
+                    <button class="btn btn-ghost btn-sm" type="button" data-role="filter-clear">Clear</button>
+                    <button class="btn btn-sm" type="button" data-role="filter-close">Done</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <ul class="tri-list" data-role="list"></ul>
+          </div>
+
+          <div class="tri-col" data-bucket="onlyAfter">
+            <div class="tri-stripe stripe-sky"></div>
+            <div class="tri-head">
+              <div class="tri-title">Only in After <span class="tri-count" data-role="count">0</span></div>
+              <input class="tri-search" type="search" placeholder="Search genes…" data-role="search" />
+              <div class="tri-filter" data-role="filter">
+                <button class="filter-toggle" data-role="filter-toggle" type="button">Filter by domain type</button>
+                <div class="filter-panel hidden" data-role="filter-panel">
+                  <input type="search" class="filter-search" placeholder="Find domain types…" data-role="filter-search" />
+                  <div class="filter-options" data-role="filter-options"></div>
+                  <div class="filter-actions">
+                    <button class="btn btn-ghost btn-sm" type="button" data-role="filter-clear">Clear</button>
+                    <button class="btn btn-sm" type="button" data-role="filter-close">Done</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <ul class="tri-list" data-role="list"></ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- Q2 viz 1 -->
+      <section class="result-section">
+        <div class="section-head">
+          <h2>2a. Domain instances added &amp; removed</h2>
+          <p class="section-sub">Each row is a unique <em>(domain, gene, start, end)</em>. Diff is across the full files — no shared-gene filter.</p>
+          <div class="section-controls">
+            <label class="ctrl">
+              <span>Sort</span>
+              <select id="q2a-sort">
+                <option value="asc">A → Z</option>
+                <option value="desc">Z → A</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <div class="tri-grid" id="q2a-grid">
+          <div class="tri-col" data-bucket="onlyBefore">
+            <div class="tri-stripe stripe-dust"></div>
+            <div class="tri-head">
+              <div class="tri-title">Only in Before <span class="tri-count" data-role="count">0</span></div>
+              <input class="tri-search" type="search" placeholder="Search domain or gene…" data-role="search" />
+            </div>
+            <ul class="tri-list" data-role="list"></ul>
+          </div>
+          <div class="tri-col" data-bucket="both">
+            <div class="tri-stripe stripe-moss"></div>
+            <div class="tri-head">
+              <div class="tri-title">In Both <span class="tri-count" data-role="count">0</span></div>
+              <input class="tri-search" type="search" placeholder="Search domain or gene…" data-role="search" />
+            </div>
+            <ul class="tri-list" data-role="list"></ul>
+          </div>
+          <div class="tri-col" data-bucket="onlyAfter">
+            <div class="tri-stripe stripe-sky"></div>
+            <div class="tri-head">
+              <div class="tri-title">Only in After <span class="tri-count" data-role="count">0</span></div>
+              <input class="tri-search" type="search" placeholder="Search domain or gene…" data-role="search" />
+            </div>
+            <ul class="tri-list" data-role="list"></ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- Q2 viz 2 -->
+      <section class="result-section">
+        <div class="section-head">
+          <h2>2b. Domain count comparison</h2>
+          <p class="section-sub">Per-domain-name occurrence counts across all rows in each file.</p>
+          <div class="section-controls">
+            <label class="ctrl">
+              <span>Order</span>
+              <select id="q2b-sort">
+                <option value="desc">Most → Least</option>
+                <option value="asc">Least → Most</option>
+              </select>
+            </label>
+            <div class="legend">
+              <span class="legend-swatch swatch-moss"></span>Before
+              <span class="legend-swatch swatch-sky"></span>After
+            </div>
+          </div>
+        </div>
+        <div class="bar-wrap">
+          <svg id="q2b-bars" class="bar-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+        </div>
+      </section>
+
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <span>Soot sprites approve.</span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+# Downloaded AlphaFold structures (regenerable, too large for git)
+alphaFold/
+struct_cache/
+
+# Python environment and caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# macOS metadata
+.DS_Store
+
+# Excel temp files (created while a file is open)
+~$*.xlsx
+~$*.xls

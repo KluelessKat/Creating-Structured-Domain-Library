@@ -141,11 +141,11 @@ def plddtMean(domainPDBFile):
 
     return round(sum(plddtValues)/len(plddtValues), 2) #Return the mean pLDDT value for the domain
 
-outputDir='/Users/joseparedes/Desktop/kappelLab/alphaFold/dbFiles' #Specify where you want (should be a folder) to store all of the PAE and PDB files we will be downloading. Note that each one is typically less than a MB in size. 
+outputDir='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/alphaFold/dbFiles' #Specify where you want (should be a folder) to store all of the PAE and PDB files we will be downloading. Note that each one is typically less than a MB in size. 
 
 #File Pathnames. Change them to match yours.  
-input='/Users/joseparedes/Desktop/kappelLab/structuredDomainLibrary/2_domainLibraryStructuredSeq.tsv'
-output='/Users/joseparedes/Desktop/kappelLab/structuredDomainLibrary/3_domainLibraryInteractions.tsv'
+input='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/04212026_metapredict/2_domainLibraryStructuredSeq_meta.tsv'
+output='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/04282026_metapredict/3_domainLibraryInteractions_meta.tsv'
 
 #Prepare a dataframe to store interaction metrics for domain sequences
 df=pd.read_csv(input, sep="\t")
@@ -172,10 +172,10 @@ for idx, sequence in df.iterrows(): #Go through each domain sequence
         print(f"Skipping {sequence['Entry']} domain {domainStart}-{domainEnd}: out of protein range (1-{proteinLength})")
         continue
 
-    domainPDBFile=os.path.join(outputDir, f"{sequence["Entry"]}_domain_model.pdb")
+    domainPDBFile=os.path.join(outputDir, f"{sequence['Entry']}_domain_model.pdb")
     exciseDomainPDB(PDBFile, domainPDBFile, domainStart, domainEnd) #Extract the isolated domain strucuture
     
-    plddt=plddtMean(PDBFile)
+    plddt=plddtMean(domainPDBFile)
     df.at[idx, "meanDomainplddt"]=plddt #Calculate the mean pLDDT of a domain
     if plddt>=80: #Only compute interaction metrics for confident domain structures
         df.at[idx, "anchoringIndex"]=anchoringIndex(paeFile, domainStart, domainEnd)

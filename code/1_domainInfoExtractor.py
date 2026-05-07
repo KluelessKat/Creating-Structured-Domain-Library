@@ -2,8 +2,8 @@ import pandas as pd
 import re
 
 #File Pathnames. Change them to match yours.   
-input="/Users/joseparedes/Desktop/kappelLab/structuredDomainLibrary/humanProteome.tsv"
-output="/Users/joseparedes/Desktop/kappelLab/structuredDomainLibrary/1_domainLibraryRaw.tsv"
+input="/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/jpl_code/Creating-Structured-Domain-Library/humanProteome_KZ.tsv"
+output="/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/jpl_code/Creating-Structured-Domain-Library/1_domainLibraryRaw.tsv"
 df=pd.read_csv(input, sep="\t")
 
 outputEntries=[]#Where we will store domain sequences and their relevant info

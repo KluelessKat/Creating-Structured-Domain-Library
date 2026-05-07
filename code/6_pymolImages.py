@@ -1,6 +1,7 @@
 from pymol import cmd
 from PIL import Image, ImageDraw, ImageFont
 import pandas as pd
+import os
 
 def takePymolImage(pdbFile, start, end, output):
     '''Take an image of a given protein with a specified domain highlighted in pymol'''
@@ -52,34 +53,61 @@ def tileImages(imagePaths, output, maxCols, annotations, fontSize=50):
             draw.text((lineCoordinateX, lineCoordinateY), line, fill="white", font=font)
     tiledImage.save(output)
 
-#File Pathnames. Change them to match yours.  
-input='/Users/joseparedes/Desktop/kappelLab/structuredDomainLibrary/5_finalCandidateSequences.tsv'
-tileOutput='/Users/joseparedes/Desktop/kappelLab/structuredDomainLibrary/images/1_allFilters.png'
+#File Pathnames. Change them to match yours.
+input = '/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/04282026_metapredict/5_finalCandidateSequences_meta.tsv'
+#'/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/04212026_iupred3/5_finalCandidateSequences_iupred3.tsv'
+baseOutputDir='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/04282026_metapredict'
+imagesDir=os.path.join(baseOutputDir, 'images')
+if os.path.exists(imagesDir):
+    i=1
+    while os.path.exists(f"{imagesDir}_{i}"):
+        i+=1
+    imagesDir=f"{imagesDir}_{i}"
+os.makedirs(imagesDir)
+tileOutput=os.path.join(imagesDir, '1_allFilters.png')
 df=pd.read_csv(input, sep="\t")
 
 entriesDictionary={}
 for entry, group in df.groupby('Entry'):#Record relevant info for each domain sequence to help create annotations
-    entriesDictionary[entry]=group[['Domain', 'Domain Sequence', 'Start', 'End', 'candidateSequence']].values.tolist()
+    entriesDictionary[entry]=group[['Domain', 'Domain Sequence', 'Start', 'End']].values.tolist()
+
+    #entriesDictionary[entry]=group[['Domain', 'Domain Sequence', 'Start', 'End', 'candidateSequence']].values.tolist()
  
 imagePaths=[]
 annotations=[]
 for entry, rows in entriesDictionary.items():#Go through each protein 
     for row in rows: #Go through each domain of a protein
-        domain, domainSeq, start, end, driverClass=row
-        if driverClass!="Neither":#If the sequence is a candidate sequence, capture an image of it and make an annotation for it
-            print(f"Imaging {entry}")
-            pdbFile=f"https://alphafold.ebi.ac.uk/files/AF-{entry}-F1-model_v6.pdb"
-            output=f"/Users/joseparedes/Desktop/kappelLab/structuredDomainLibrary/images/{entry}_{start}_{end}.png" #Specify the folder that will hold individual images
-            takePymolImage(pdbFile, start, end, output)
-            imagePaths.append(output)
-            annotation={
+        domain, domainSeq, start, end = row#, driverClass=row
+        print(f"Imaging {entry}")
+        pdbFile=f"https://alphafold.ebi.ac.uk/files/AF-{entry}-F1-model_v6.pdb"
+        output=os.path.join(imagesDir, f"{entry}_{start}_{end}.png") #Specify the folder that will hold individual images
+        takePymolImage(pdbFile, start, end, output)
+        imagePaths.append(output)
+        annotation={
                 "Entry": entry,
                 "Domain": domain,
                 "Domain Sequence": domainSeq,
                 "Start": start,
-                "End": end,
-                "driverClass": driverClass}
-            annotations.append(annotation)
+                "End": end
+                #"driverClass": driverClass
+                }
+        annotations.append(annotation)
+        
+        #if driverClass!="Neither":#If the sequence is a candidate sequence, capture an image of it and make an annotation for it
+            # print(f"Imaging {entry}")
+            # pdbFile=f"https://alphafold.ebi.ac.uk/files/AF-{entry}-F1-model_v6.pdb"
+            # output=f"/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/04212026_iupred3/2_images/{entry}_{start}_{end}.png" #Specify the folder that will hold individual images
+            # takePymolImage(pdbFile, start, end, output)
+            # imagePaths.append(output)
+            # annotation={
+            #     "Entry": entry,
+            #     "Domain": domain,
+            #     "Domain Sequence": domainSeq,
+            #     "Start": start,
+            #     "End": end
+            #     #"driverClass": driverClass
+            #     }
+            # annotations.append(annotation)
 
 tileImages(imagePaths, tileOutput, 5, annotations) #Create a tiled image of all candidate sequences
 print(f"Saved tiled image to {tileOutput}")
