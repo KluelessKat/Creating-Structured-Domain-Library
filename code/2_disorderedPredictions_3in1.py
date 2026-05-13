@@ -2,9 +2,10 @@
 """
 2_disorderedPredictions.py
 
-Run disorder prediction on domain sequences using metapredict, AIUPred,
-IUPred3, and AlphaFold pLDDT together, then filter the library based on a
-chosen predictor (or combination) in a single pass.
+Run disorder prediction on domain sequences using metapredict and AlphaFold
+pLDDT by default (AIUPred and IUPred3 are skipped unless explicitly enabled),
+then filter the library based on a chosen predictor (or combination) in a
+single pass.
 
 All predictors are always run. The output TSV carries per-predictor columns
 side-by-side plus derived consensus columns so you can compare post-hoc.
@@ -56,6 +57,8 @@ Filter mode choices (--filter-mode):
 from __future__ import annotations
 
 import argparse
+import gzip
+import math
 import sys
 import warnings
 from dataclasses import dataclass
@@ -65,6 +68,25 @@ from typing import Callable, Optional
 import numpy as np
 import pandas as pd
 import requests
+
+# ---------------------------------------------------------------------------
+# AlphaFold fragment helpers
+# ---------------------------------------------------------------------------
+# AF DB splits proteins >1400 AA into overlapping 1400-AA fragments (step=1200).
+# Fragment PDB files use LOCAL residue numbering (1 to ~1400).
+# F1: global 1-1400 (offset 0), F2: global 1201-2600 (offset 1200), etc.
+
+FRAG_STEP = 1200
+
+def getAFFragment(domainStart: int) -> int:
+    '''Return the AF fragment number whose local coords contain domainStart.'''
+    if domainStart <= 1400:
+        return 1
+    return math.ceil(domainStart / FRAG_STEP)
+
+def globalToLocal(pos: int, fragment: int) -> int:
+    '''Convert a global UniProt residue position to a local fragment position.'''
+    return pos - (fragment - 1) * FRAG_STEP
 
 
 # ---------------------------------------------------------------------------
@@ -154,56 +176,98 @@ def load_iupred3(iupred3_dir: Optional[Path],
 # lines, so nothing is written to disk. Results are cached in memory keyed by
 # UniProt ID so each protein is fetched at most once per run.
 
-_plddt_cache: dict[str, Optional[dict[int, float]]] = {}
+# Cache keyed by (uniprot_id, fragment) so each fragment is fetched at most once.
+_plddt_cache: dict[tuple[str, int], Optional[dict[int, float]]] = {}
 
 
-def _fetch_plddt_for_protein(uniprot_id: str) -> Optional[dict[int, float]]:
-    """Stream the AlphaFold PDB for one protein and return {resnum: pLDDT}.
-    Returns None on network failure, empty dict on 404 (no AF model).
-    Only F1 is fetched, which covers ~99 % of human proteins.
-    """
-    if uniprot_id in _plddt_cache:
-        return _plddt_cache[uniprot_id]
-
-    url = (f"https://alphafold.ebi.ac.uk/files/"
-           f"AF-{uniprot_id}-F1-model_{ALPHAFOLD_VERSION}.pdb")
-    try:
-        r = requests.get(url, timeout=30, stream=True)
-        if r.status_code == 404:
-            _plddt_cache[uniprot_id] = {}
-            return {}
-        r.raise_for_status()
-    except requests.RequestException as e:
-        warnings.warn(f"pLDDT fetch failed for {uniprot_id}: {e}")
-        _plddt_cache[uniprot_id] = None
-        return None
-
+def _parse_pdb_ca_bfactors(lines) -> dict[int, float]:
+    '''Parse CA ATOM lines from an iterable of PDB lines (str or bytes).
+    Returns {local_resnum: pLDDT}.'''
     result: dict[int, float] = {}
-    for line in r.iter_lines(decode_unicode=True):
+    for raw in lines:
+        line = raw.decode("ascii", errors="ignore") if isinstance(raw, bytes) else raw
         if not line.startswith("ATOM"):
             continue
         if line[12:16].strip() != "CA":
             continue
         try:
-            resnum = int(line[22:26])
+            resnum  = int(line[22:26])
             bfactor = float(line[60:66])
         except ValueError:
             continue
         if resnum not in result:
             result[resnum] = bfactor
-
-    _plddt_cache[uniprot_id] = result
     return result
 
 
-def score_plddt_domain(uniprot_id: str, dstart: int, dend: int) -> Optional[float]:
-    """Return mean pLDDT over domain residues [dstart, dend] (1-indexed, inclusive).
-    Returns None if the protein cannot be fetched or no CA atoms fall in range.
+def _fetch_plddt_for_fragment(uniprot_id: str, fragment: int,
+                               af_dir: Optional[Path] = None
+                               ) -> Optional[dict[int, float]]:
+    """Return {local_resnum: pLDDT} for the given entry + fragment.
+    Checks af_dir first (unzipped or .gz), then falls back to AlphaFold EBI.
+    Returns None on network failure, empty dict on 404 (no AF model).
     """
-    protein_plddt = _fetch_plddt_for_protein(uniprot_id)
-    if not protein_plddt:
+    cache_key = (uniprot_id, fragment)
+    if cache_key in _plddt_cache:
+        return _plddt_cache[cache_key]
+
+    # --- 1. Check local af_dir first ----------------------------------------
+    if af_dir and af_dir.is_dir():
+        candidates: list[Path] = []
+        if fragment == 1:                          # step-3 naming convention
+            candidates += [
+                af_dir / f"{uniprot_id}_model.pdb",
+                af_dir / f"{uniprot_id}_model.pdb.gz",
+            ]
+        candidates += [
+            af_dir / f"AF-{uniprot_id}-F{fragment}-model_v6.pdb",
+            af_dir / f"AF-{uniprot_id}-F{fragment}-model_v6.pdb.gz",
+        ]
+        for path in candidates:
+            if path.exists():
+                if path.suffix == '.gz':
+                    with gzip.open(path, 'rt', errors='ignore') as fh:
+                        result = _parse_pdb_ca_bfactors(fh)
+                else:
+                    with open(path, 'r', errors='ignore') as fh:
+                        result = _parse_pdb_ca_bfactors(fh)
+                _plddt_cache[cache_key] = result or {}
+                return _plddt_cache[cache_key]
+
+    # --- 2. Fall back to AlphaFold EBI URL ----------------------------------
+    url = (f"https://alphafold.ebi.ac.uk/files/"
+           f"AF-{uniprot_id}-F{fragment}-model_{ALPHAFOLD_VERSION}.pdb")
+    try:
+        r = requests.get(url, timeout=30, stream=True)
+        if r.status_code == 404:
+            _plddt_cache[cache_key] = {}
+            return {}
+        r.raise_for_status()
+    except requests.RequestException as e:
+        warnings.warn(f"pLDDT fetch failed for {uniprot_id} F{fragment}: {e}")
+        _plddt_cache[cache_key] = None
         return None
-    scores = [protein_plddt[r] for r in range(dstart, dend + 1) if r in protein_plddt]
+
+    result = _parse_pdb_ca_bfactors(r.iter_lines())
+    _plddt_cache[cache_key] = result or {}
+    return _plddt_cache[cache_key]
+
+
+def score_plddt_domain(uniprot_id: str, dstart: int, dend: int,
+                        af_dir: Optional[Path] = None) -> Optional[float]:
+    """Return mean pLDDT over domain residues [dstart, dend] (global, 1-indexed).
+    Automatically picks the correct AF fragment and converts to local coords.
+    Returns None if the fragment cannot be fetched or no CA atoms fall in range.
+    """
+    fragment   = getAFFragment(dstart)
+    localStart = globalToLocal(dstart, fragment)
+    localEnd   = globalToLocal(dend,   fragment)
+
+    frag_plddt = _fetch_plddt_for_fragment(uniprot_id, fragment, af_dir)
+    if not frag_plddt:
+        return None
+    scores = [frag_plddt[r] for r in range(localStart, localEnd + 1)
+              if r in frag_plddt]
     if not scores:
         return None
     return float(np.mean(scores))
@@ -352,6 +416,12 @@ def apply_filter(df: pd.DataFrame, target: str, mode: str,
             if col not in df.columns:
                 sys.exit(f"ERROR: column '{col}' missing — metapredict probably "
                          "failed to load.")
+        if df[mc].isna().all():
+            sys.exit("ERROR: metapredict_and_plddt filter selected but all "
+                     "metapredict scores are NaN — metapredict failed to load "
+                     "or produced no output. Install it with:\n"
+                     "  pip install metapredict\n"
+                     "Or use --filter-on plddt to filter on pLDDT alone.")
         if 'plddt_mean_domain' not in df.columns:
             sys.exit("ERROR: plddt_mean_domain column missing — pLDDT scoring "
                      "was skipped (pass --skip plddt to disable pLDDT or "
@@ -421,17 +491,30 @@ def main():
                     default='structured',
                     help='Keep structured domains (default), disordered '
                          'regions, or skip filtering entirely')
-    ap.add_argument('--skip', action='append', default=[],
+    ap.add_argument('--skip', action='append', default=None,
                     choices=['metapredict', 'aiupred', 'iupred3', 'plddt'],
-                    help='Skip a predictor even if available (repeatable). '
-                         'Use --skip plddt to disable the AlphaFold pLDDT '
-                         'fetch entirely.')
+                    help='Skip a predictor (repeatable). By default aiupred and '
+                         'iupred3 are skipped (only metapredict + pLDDT run). '
+                         'Passing any --skip flag replaces the default entirely, '
+                         'so --skip plddt runs all three disorder predictors '
+                         'without pLDDT, and --skip aiupred --skip iupred3 '
+                         'restores the default explicitly.')
+    ap.add_argument('--af-dir', type=Path, default=None, metavar='DIR',
+                    help='Optional directory of cached AlphaFold PDB files '
+                         '(e.g. the --af-dir used in steps 3 & 4). Checked '
+                         'before downloading from AlphaFold EBI. Supports '
+                         'both .pdb and .pdb.gz files. Handles proteins with '
+                         '>1400 AA by selecting the correct fragment.')
     ap.add_argument('--plddt-threshold', type=float, default=PLDDT_THRESHOLD,
                     help=f'Mean pLDDT threshold for the structured-domain '
                          f'filter (default: {PLDDT_THRESHOLD}). Domains with '
                          f'mean pLDDT >= this pass. AlphaFold color boundaries: '
                          f'70 = confident, 80 = high confidence.')
     args = ap.parse_args()
+
+    # If no --skip flags were given, apply the default: run only metapredict + pLDDT.
+    # Any explicit --skip flag(s) replace this default entirely.
+    skip = args.skip if args.skip is not None else ['aiupred', 'iupred3']
 
     # Apply the hardcoded default from the top of the script when the CLI
     # flag was not explicitly provided.
@@ -441,16 +524,16 @@ def main():
 
     # --- Load predictors ---------------------------------------------------
     all_predictors: list[Predictor] = []
-    if 'metapredict' not in args.skip:
+    if 'metapredict' not in skip:
         all_predictors.append(load_metapredict())
-    if 'aiupred' not in args.skip:
+    if 'aiupred' not in skip:
         all_predictors.append(load_aiupred())
-    if 'iupred3' not in args.skip:
+    if 'iupred3' not in skip:
         all_predictors.append(load_iupred3(iupred3_dir,
                                            mode=args.iupred3_mode,
                                            smoothing=args.iupred3_smoothing))
 
-    run_plddt = 'plddt' not in args.skip
+    run_plddt = 'plddt' not in skip
 
     print('Predictor status:')
     for p in all_predictors:
@@ -490,14 +573,17 @@ def main():
 
     # --- Score pLDDT per domain -------------------------------------------
     if run_plddt:
-        print('\nFetching pLDDT scores from AlphaFold EBI ...')
+        af_dir = args.af_dir
+        src = f"local cache ({af_dir}) + AlphaFold EBI" if af_dir else "AlphaFold EBI"
+        print(f'\nFetching pLDDT scores ({src}) ...')
         plddt_scores = []
         for i, (_, row) in enumerate(df.iterrows(), start=1):
             if i % 200 == 0 or i == len(df):
                 print(f'  pLDDT {i:,}/{len(df):,}')
             plddt_scores.append(
                 score_plddt_domain(str(row['Entry']),
-                                   int(row['Start']), int(row['End'])))
+                                   int(row['Start']), int(row['End']),
+                                   af_dir=af_dir))
         df['plddt_mean_domain'] = plddt_scores
 
     # --- Derived consensus columns ----------------------------------------
@@ -520,6 +606,15 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     df_filtered.to_csv(args.output, sep='\t', index=False)
     print(f'\nWrote filtered library:  {args.output}  ({len(df_filtered):,} rows)')
+
+    # Eliminated library: rows that did not pass the filter, same columns.
+    if args.filter_mode != 'none' and args.filter_on != 'none':
+        df_eliminated = df[~df.index.isin(df_filtered.index)].copy()
+        elim_output = args.output.with_name(
+            args.output.stem + '_eliminated' + args.output.suffix)
+        elim_output.parent.mkdir(parents=True, exist_ok=True)
+        df_eliminated.to_csv(elim_output, sep='\t', index=False)
+        print(f'Wrote eliminated library: {elim_output}  ({len(df_eliminated):,} rows)')
  
     # Decide where the "all" file goes.
     if args.output_all is None:

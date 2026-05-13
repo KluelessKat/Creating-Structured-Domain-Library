@@ -1,9 +1,17 @@
+import argparse
 import pandas as pd
 import re
 
-#File Pathnames. Change them to match yours.   
-input="/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/jpl_code/Creating-Structured-Domain-Library/humanProteome_KZ.tsv"
-output="/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/jpl_code/Creating-Structured-Domain-Library/1_domainLibraryRaw.tsv"
+ap = argparse.ArgumentParser(description='Step 1: Extract domain sequences from a UniProt proteome TSV.')
+ap.add_argument('--input',
+                default='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/jpl_code/Creating-Structured-Domain-Library/humanProteome_KZ.tsv',
+                help='Input UniProt proteome TSV (hardcoded default)')
+ap.add_argument('--output',
+                default='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/jpl_code/Creating-Structured-Domain-Library/1_domainLibraryRaw.tsv',
+                help='Output TSV path')
+_args = ap.parse_args()
+input  = _args.input
+output = _args.output
 df=pd.read_csv(input, sep="\t")
 
 outputEntries=[]#Where we will store domain sequences and their relevant info

@@ -1,153 +1,218 @@
+import argparse
+import gzip
+import math
 import requests
 import os
 import json
+from pathlib import Path
 import numpy as np
 import freesasa
 from Bio import PDB
 from scipy.spatial.distance import cdist
 import pandas as pd
 
-def downloadAlphaFoldFiles(uniprotID, outputDir):
-    '''Uses a protein's uniprot accession number to download its predicted structure's PAE and PDB files from AlphaFoldDB'''
-    
-    #The pathnames used for downloading and storing the files. You likely don't have to change anything here. However, it is possible that some protein stuctures may have been predicted with a different AlphaFold model than v6; if so, you can change the version number to match.
-    pdbDownloadUrl=f"https://alphafold.ebi.ac.uk/files/AF-{uniprotID}-F1-model_v6.pdb"
-    pdbOutputPath=os.path.join(outputDir, f"{uniprotID}_model.pdb")
-    paeDownloadUrl=f"https://alphafold.ebi.ac.uk/files/AF-{uniprotID}-F1-predicted_aligned_error_v6.json"
-    paeOutputPath=os.path.join(outputDir, f"{uniprotID}_PAE.json")
+# ---------------------------------------------------------------------------
+# Fragment helpers
+# ---------------------------------------------------------------------------
+# AlphaFold DB splits proteins > ~1400 AA into overlapping fragments.
+# Each fragment is 1400 AA long with a 200 AA overlap → step = 1200 AA.
+# Fragment PDB files use LOCAL residue numbering (1 to ~1400), NOT global
+# UniProt positions.  Convert before any residue-based calculation.
+#   F1: global  1–1400  → local offset 0
+#   F2: global  1201–2600 → local offset 1200
+#   F3: global  2401–3800 → local offset 2400  …
+FRAG_STEP = 1200
 
-    try:#Download the PAE and PDB files if you have not already
-        if not os.path.exists(pdbOutputPath):
-            response=requests.get(pdbDownloadUrl, stream=True)
-            response.raise_for_status()
-            with open(pdbOutputPath, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):#Write the PDB file contents into a new file saved to your system
-                    f.write(chunk)
-            print(f"Downloaded PDB file for {uniprotID}")
-        else:
-            print(f"PDB file already exists for {uniprotID}, skipping download.")
+def getAFFragment(domainStart):
+    '''Return the AlphaFold fragment number that contains the given global residue.'''
+    if domainStart <= 1400:
+        return 1
+    return math.ceil(domainStart / FRAG_STEP)
 
-        if not os.path.exists(paeOutputPath):
-            response=requests.get(paeDownloadUrl, stream=True)
+def globalToLocal(pos, fragment):
+    '''Convert a global UniProt residue position to a local fragment position.'''
+    return pos - (fragment - 1) * FRAG_STEP
+
+def _ensureUnzipped(gzPath, destPath):
+    '''Decompress gzPath → destPath (skipped if destPath already exists). Returns destPath.'''
+    if not os.path.exists(destPath):
+        with gzip.open(gzPath, 'rb') as gz, open(destPath, 'wb') as out:
+            out.write(gz.read())
+    return destPath
+
+# ---------------------------------------------------------------------------
+# AlphaFold file retrieval  (local cache first, then URL)
+# ---------------------------------------------------------------------------
+
+def getAlphaFoldFiles(uniprotID, fragment, outputDir):
+    '''Return paths to an unzipped PDB and PAE JSON for the given entry + fragment.
+    Checks outputDir for cached files (unzipped or .gz) before downloading.
+    Returns ("", "") if either file cannot be obtained.'''
+
+    # Determine canonical output paths for unzipped files
+    if fragment == 1:
+        pdbDest = os.path.join(outputDir, f"{uniprotID}_model.pdb")
+        paeDest = os.path.join(outputDir, f"{uniprotID}_PAE.json")
+    else:
+        pdbDest = os.path.join(outputDir, f"AF-{uniprotID}-F{fragment}-model_v6.pdb")
+        paeDest = os.path.join(outputDir, f"AF-{uniprotID}-F{fragment}-PAE.json")
+
+    def _resolveFile(destPath, urlPath, label):
+        '''Return destPath if already present; decompress .gz if available; else download.'''
+        if os.path.exists(destPath):
+            print(f"  Using local {label}: {destPath}")
+            return destPath
+        # Check .gz variants in af-dir (both canonical and AF DB naming)
+        gzCandidates = [
+            destPath + ".gz",
+            os.path.join(outputDir, f"AF-{uniprotID}-F{fragment}-model_v6.pdb.gz")
+                if label == "PDB" else
+            os.path.join(outputDir, f"AF-{uniprotID}-F{fragment}-predicted_aligned_error_v6.json.gz"),
+        ]
+        for gzPath in gzCandidates:
+            if os.path.exists(gzPath):
+                print(f"  Decompressing local {label}: {gzPath}")
+                return _ensureUnzipped(gzPath, destPath)
+        # Fall back to URL download
+        try:
+            response = requests.get(urlPath, stream=True)
             response.raise_for_status()
-            with open(paeOutputPath, 'wb') as f:
+            with open(destPath, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
-            print(f"Downloaded PAE file for {uniprotID}")
-        else:
-            print(f"PAE file already exists for {uniprotID}, skipping download.")
+            print(f"  Downloaded {label} for {uniprotID} F{fragment}")
+            return destPath
+        except requests.exceptions.RequestException as e:
+            print(f"  Failed to obtain {label} for {uniprotID} F{fragment}: {e}")
+            return ""
 
-        return paeOutputPath, pdbOutputPath
+    pdbUrl = f"https://alphafold.ebi.ac.uk/files/AF-{uniprotID}-F{fragment}-model_v6.pdb"
+    paeUrl = f"https://alphafold.ebi.ac.uk/files/AF-{uniprotID}-F{fragment}-predicted_aligned_error_v6.json"
 
-    except requests.exceptions.RequestException as e:
-        print(f"Failed to download files for {uniprotID}. Error: {e}")
-        return "", ""
+    pdbPath = _resolveFile(pdbDest, pdbUrl, "PDB")
+    paePath = _resolveFile(paeDest, paeUrl, "PAE")
+    return paePath, pdbPath
+
+# ---------------------------------------------------------------------------
+# Domain metric functions  (all accept LOCAL residue coords)
+# ---------------------------------------------------------------------------
 
 def exciseDomainPDB(inputPDB, outputPDB, domainStart, domainEnd):
-    '''Extract and save only the structural information of a specific domain into a PDB file using data from its parent structure'''
-    
-    if os.path.exists(outputPDB):#Only excise the domain if we have not already
+    '''Extract and save only the structural information of a specific domain.
+    domainStart/domainEnd must be LOCAL fragment residue numbers.'''
+    if os.path.exists(outputPDB):
         print(f"Domain PDB already exists: {outputPDB}")
         return outputPDB
-    
-    #PDB files hold info in the following hierarchy: structure -> model -> chain -> residue -> atom
-    parser=PDB.PDBParser(QUIET=True) #Load the protein structure
+
+    parser=PDB.PDBParser(QUIET=True)
     fullProtein=parser.get_structure("protein", inputPDB)
-    proteinModel=fullProtein[0] #AlphaFold structures are single models, so we just take the first and only one
-    proteinChain=next(proteinModel.get_chains()) #From that model, we take the first chain, as AlphaFold only outputs a single chain
+    proteinModel=fullProtein[0]
+    proteinChain=next(proteinModel.get_chains())
 
-    domain=PDB.Structure.Structure("domain") #Create a structured object to store the domain model
-    domainModel=PDB.Model.Model(0) #Create a model to hold the domain chain
-    domain.add(domainModel) #Add the domain model to the structure
-    domainChain=PDB.Chain.Chain(proteinChain.id) #Create a chain to hold the domain residues
+    domain=PDB.Structure.Structure("domain")
+    domainModel=PDB.Model.Model(0)
+    domain.add(domainModel)
+    domainChain=PDB.Chain.Chain(proteinChain.id)
 
-    for residue in proteinChain: #Only add domain residues to the domain chain
+    for residue in proteinChain:
         residueNum=residue.id[1]
         if domainStart <= residueNum <= domainEnd:
             domainChain.add(residue.copy())
 
-    domainModel.add(domainChain) #Add the domain chain to the domain model
+    domainModel.add(domainChain)
     io=PDB.PDBIO()
     io.set_structure(domain)
     io.save(outputPDB)
     print(f"New domain saved to: {outputPDB}")
 
 def anchoringIndex(paeFile, domainStart, domainEnd):
-    '''Uses the PAE file of a protein to measure how constrained one of its domains is by it. Helps us determine if domain B has to be around residues X-Y. Note that this is not a measure of interaction strength'''
-
-    with open(paeFile, "r") as f: #Open and load PAE data
+    '''Uses the PAE matrix to measure how constrained the domain is by its parent fragment.
+    domainStart/domainEnd must be LOCAL fragment residue numbers.'''
+    with open(paeFile, "r") as f:
         data=json.load(f)
-    paeMatrix=np.array(data[0]["predicted_aligned_error"]) #A matrix of PAE values for every possible residue pair
+    paeMatrix=np.array(data[0]["predicted_aligned_error"])
 
-    domainResidues=np.arange(domainStart-1, domainEnd) #Define domain residues
-    proteinResidues=np.setdiff1d(np.arange(paeMatrix.shape[0]), domainResidues) #Define non-domain residues
-    paeBetween=paeMatrix[np.ix_(domainResidues, proteinResidues)] #Extract PAE values between domain residues and all non-domain residues
-    lowPAE=paeBetween<=5 #Any PAE value <= 5 Å  is converted to a 1, while any value above > 5 Å is turned to a 0. A value of 1 indicates the model is confident in the relative positioning of that residue pair; 0 indicates uncertainty.
+    domainResidues=np.arange(domainStart-1, domainEnd)        # 0-indexed local
+    proteinResidues=np.setdiff1d(np.arange(paeMatrix.shape[0]), domainResidues)
+    paeBetween=paeMatrix[np.ix_(domainResidues, proteinResidues)]
+    lowPAE=paeBetween<=5
 
-    perResidueAnchoring=np.sum(lowPAE, axis=1)/len(proteinResidues) #For each domain residue, compute the fraction of non-domain residues it is confidently positioned relative to.
-    anchoringIndex=np.mean(perResidueAnchoring) #Take the mean across all domain residues to obtain a score reflecting how constrained the domain is by its parent protein
-    return anchoringIndex
-   
+    perResidueAnchoring=np.sum(lowPAE, axis=1)/len(proteinResidues)
+    return np.mean(perResidueAnchoring)
+
 def fractionBuried(pdbFile, domainPDBFile, domainStart, domainEnd):
-    '''Calculates the fraction of a domain that is buried within its parent protein'''
-    
-    fullProtein=freesasa.Structure(pdbFile) #Load the protein structure.
-    fpResult=freesasa.calc(fullProtein) #Calculates the surface area of each residue in the protein that is accessible to solvent in Å^2. 
-    domainInProtein=freesasa.selectArea([f'r{domainStart}_{domainEnd}, resi {domainStart}-{domainEnd}'], fullProtein, fpResult)
-    domainInProteinSASA=domainInProtein[f'r{domainStart}_{domainEnd}'] #The amount of surface area of the domain that is accessible to solvent while it is in its parent protein.
+    '''Calculates the fraction of a domain buried within its parent fragment.
+    domainStart/domainEnd must be LOCAL fragment residue numbers.'''
+    fullProtein=freesasa.Structure(pdbFile)
+    fpResult=freesasa.calc(fullProtein)
+    domainInProtein=freesasa.selectArea(
+        [f'r{domainStart}_{domainEnd}, resi {domainStart}-{domainEnd}'],
+        fullProtein, fpResult)
+    domainInProteinSASA=domainInProtein[f'r{domainStart}_{domainEnd}']
 
-    domainOnly=freesasa.Structure(domainPDBFile)#Load the isolated domain structure
-    doResult=freesasa.calc(domainOnly) #Calculates the surface area of each residue in the isolated domain structure that is accessible to solvent. 
+    domainOnly=freesasa.Structure(domainPDBFile)
+    doResult=freesasa.calc(domainOnly)
     domainOnlySASA=doResult.totalArea()
     deltaSASA=domainOnlySASA-domainInProteinSASA
-
-    return deltaSASA/domainOnlySASA #Fraction of the domain that is buried in its parent protein
+    return deltaSASA/domainOnlySASA
 
 def contactDensity(pdbFile, domainStart, domainEnd):
-    '''Quantifies the number of interactions a domain has with its parent protein by returning the fraction of total possible contacts found between the domain and protein'''
-    
-    parser=PDB.PDBParser(QUIET=True) #Load the protein structure
+    '''Quantifies interactions between the domain and the rest of its parent fragment.
+    domainStart/domainEnd must be LOCAL fragment residue numbers.'''
+    parser=PDB.PDBParser(QUIET=True)
     fullProtein=parser.get_structure("protein", pdbFile)
-    proteinModel=fullProtein[0] #Load the protein model 
-    proteinChain=next(proteinModel.get_chains()) #Load the protein chain
-    
-    domainResidues=[res for res in proteinChain if domainStart <= res.get_id()[1] <= domainEnd] #Define domain residues
-    otherResidues=[res for res in proteinChain if res.get_id()[1] < domainStart or res.get_id()[1] > domainEnd] #Define non-domain residues
+    proteinChain=next(fullProtein[0].get_chains())
 
-    cutoff=4.0 #A domain residue and non-domain residue are considered to be interacting if any atom in one is within 4 Å of the other
+    domainResidues=[res for res in proteinChain if domainStart <= res.get_id()[1] <= domainEnd]
+    otherResidues=[res for res in proteinChain if res.get_id()[1] < domainStart or res.get_id()[1] > domainEnd]
+
+    cutoff=4.0
     totalContacts=0
-    for domainResidue in domainResidues: #Go through every possible domain and non-domain residue pair. For each pair, note any interactions
+    for domainResidue in domainResidues:
         domainCoordinates=np.array([atom.get_coord() for atom in domainResidue])
         for otherResidue in otherResidues:
             otherCoordinates=np.array([atom.get_coord() for atom in otherResidue])
             if np.any(cdist(domainCoordinates, otherCoordinates) < cutoff):
                 totalContacts+=1
 
-    contactDensity=totalContacts/(len(domainResidues)*len(otherResidues)) #Divide the observed interactions by the number of all possible contacts
-    return contactDensity
+    return totalContacts/(len(domainResidues)*len(otherResidues))
 
 def plddtMean(domainPDBFile):
-    '''pLDDT is a measure of how confident the AlphaFold model is in its prediction. Here, the mean pLDDT of the domain is measured'''
-
-    parser=PDB.PDBParser(QUIET=True) #Load the domain structure
+    '''Returns the mean pLDDT (B-factor) of all residues in the domain PDB.'''
+    parser=PDB.PDBParser(QUIET=True)
     domain=parser.get_structure("domain", domainPDBFile)
-    domainModel=domain[0] #Load the domain model
-    domainChain=next(domainModel.get_chains()) #Load the domain chain
+    domainChain=next(domain[0].get_chains())
 
     plddtValues=[]
-    for residue in domainChain:#Obtain the pLDDT value of every residue in the domain
+    for residue in domainChain:
         atomBfactors=[atom.get_bfactor() for atom in residue]
         plddtValues.append(sum(atomBfactors)/len(atomBfactors))
+    return round(sum(plddtValues)/len(plddtValues), 2)
 
-    return round(sum(plddtValues)/len(plddtValues), 2) #Return the mean pLDDT value for the domain
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-outputDir='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/alphaFold/dbFiles' #Specify where you want (should be a folder) to store all of the PAE and PDB files we will be downloading. Note that each one is typically less than a MB in size. 
+_ap = argparse.ArgumentParser(description='Step 3: Compute AlphaFold-based domain interaction metrics.')
+_ap.add_argument('--input',
+                 default='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/04212026_metapredict/2_domainLibraryStructuredSeq_meta.tsv',
+                 help='Input TSV (step 2 output)')
+_ap.add_argument('--output',
+                 default='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/04282026_metapredict/3_domainLibraryInteractions_meta.tsv',
+                 help='Output TSV path')
+_ap.add_argument('--af-dir',
+                 default='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/alphaFold/dbFiles',
+                 help='Directory for AlphaFold PDB/PAE files (checked before downloading)')
+_args = _ap.parse_args()
+input     = _args.input
+output    = _args.output
+outputDir = _args.af_dir
+os.makedirs(outputDir, exist_ok=True)
 
-#File Pathnames. Change them to match yours.  
-input='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/04212026_metapredict/2_domainLibraryStructuredSeq_meta.tsv'
-output='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/04282026_metapredict/3_domainLibraryInteractions_meta.tsv'
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
-#Prepare a dataframe to store interaction metrics for domain sequences
 df=pd.read_csv(input, sep="\t")
 df["anchoringIndex"]=None
 df["fractionBuried"]=None
@@ -155,35 +220,50 @@ df["contactDensity"]=None
 df["interactionIndex"]=None
 df["meanDomainplddt"]=None
 
-for idx, sequence in df.iterrows(): #Go through each domain sequence
+for idx, sequence in df.iterrows():
     domainStart=sequence["Start"]
     domainEnd=sequence["End"]
-    
-    paeFile, PDBFile=downloadAlphaFoldFiles(sequence["Entry"], outputDir)
-    if not paeFile or not PDBFile:#If the PAE and PDB files could not be downloaded for a sequence, skip to the next one
+
+    # Determine which AF fragment contains this domain and convert to local coords
+    fragment=getAFFragment(domainStart)
+    localStart=globalToLocal(domainStart, fragment)
+    localEnd=globalToLocal(domainEnd, fragment)
+    print(f"Processing {sequence['Entry']} domain {domainStart}-{domainEnd} "
+          f"(F{fragment}, local {localStart}-{localEnd})")
+
+    paeFile, PDBFile=getAlphaFoldFiles(sequence["Entry"], fragment, outputDir)
+    if not paeFile or not PDBFile:
         continue
 
     parser=PDB.PDBParser(QUIET=True)
-    fullProtein=parser.get_structure("protein", PDBFile) #Load the protein structure
+    fullProtein=parser.get_structure("protein", PDBFile)
     proteinChain=next(fullProtein[0].get_chains())
-    proteinLength=len(list(proteinChain))
+    fragmentLength=len(list(proteinChain))
 
-    if domainStart<1 or domainEnd>proteinLength: #Skip if domain coordinates are out of bounds
-        print(f"Skipping {sequence['Entry']} domain {domainStart}-{domainEnd}: out of protein range (1-{proteinLength})")
+    if localStart < 1 or localEnd > fragmentLength:
+        print(f"  Skipping: local coords {localStart}-{localEnd} out of fragment range "
+              f"(1-{fragmentLength}). Check FRAG_STEP constant.")
         continue
 
     domainPDBFile=os.path.join(outputDir, f"{sequence['Entry']}_domain_model.pdb")
-    exciseDomainPDB(PDBFile, domainPDBFile, domainStart, domainEnd) #Extract the isolated domain strucuture
-    
-    plddt=plddtMean(domainPDBFile)
-    df.at[idx, "meanDomainplddt"]=plddt #Calculate the mean pLDDT of a domain
-    if plddt>=80: #Only compute interaction metrics for confident domain structures
-        df.at[idx, "anchoringIndex"]=anchoringIndex(paeFile, domainStart, domainEnd)
-        df.at[idx, "fractionBuried"]=fractionBuried(PDBFile, domainPDBFile, domainStart, domainEnd)
-        df.at[idx, "contactDensity"]=contactDensity(PDBFile, domainStart, domainEnd)
-        df.at[idx, "interactionIndex"]=(0.247*df.at[idx, "anchoringIndex"])+(0.565*df.at[idx, "fractionBuried"])+(0.187*df.at[idx, "contactDensity"]) #Take a weighted average of the interaction metrics to get a single score reflecting how much a domain is interacting with its parent. Weights were found with a logistic regression model
+    exciseDomainPDB(PDBFile, domainPDBFile, localStart, localEnd)
 
-df=df[(df["meanDomainplddt"]>=80)].copy()#Filter out low confidence domain structures.
-print(f"{len(df)} domain sequences after mean domain plddt filtering")
-df.to_csv(output, sep='\t', index=False)
+    plddt=plddtMean(domainPDBFile)
+    df.at[idx, "meanDomainplddt"]=plddt
+    if plddt>=80:
+        df.at[idx, "anchoringIndex"]=anchoringIndex(paeFile, localStart, localEnd)
+        df.at[idx, "fractionBuried"]=fractionBuried(PDBFile, domainPDBFile, localStart, localEnd)
+        df.at[idx, "contactDensity"]=contactDensity(PDBFile, localStart, localEnd)
+        df.at[idx, "interactionIndex"]=(0.247*df.at[idx, "anchoringIndex"])+(0.565*df.at[idx, "fractionBuried"])+(0.187*df.at[idx, "contactDensity"])
+
+df_kept=df[(df["meanDomainplddt"]>=80)].copy()
+df_eliminated=df[~df.index.isin(df_kept.index)].copy()
+
+outputPath=Path(output)
+elimOutput=str(outputPath.with_name(outputPath.stem + '_eliminated' + outputPath.suffix))
+df_eliminated.to_csv(elimOutput, sep='\t', index=False)
+
+print(f"{len(df_kept)} domain sequences kept after pLDDT filtering (>= 80)")
+print(f"{len(df_eliminated)} domain sequences eliminated; saved to {elimOutput}")
+df_kept.to_csv(output, sep='\t', index=False)
 print(f"Saved domain sequences to {output}")

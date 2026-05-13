@@ -1,10 +1,12 @@
 library(tidyverse)
 
-#File Pathnames. Change them to match yours.
+#File Pathnames. Hardcoded defaults; overridden by command-line args when called
+#from run_pipeline.py: Rscript 5_obtainFinalCandidateSequences.R <input> <output>
 input <- '/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/jpl_exampleLibraryFiles/4_domainLibraryPhysicalProperties_jpl.tsv'
-#'/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/04282026_metapredict/4_domainLibraryPhysicalProperties_meta.tsv'
 output <- '/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/jpl_exampleLibraryFiles/5_finalCandidateSequences_jpl2.tsv'
-#'/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/04282026_metapredict/5_finalCandidateSequences_meta.tsv'
+args <- commandArgs(trailingOnly=TRUE)
+if (length(args) >= 1) input  <- args[1]
+if (length(args) >= 2) output <- args[2]
 df <- read_tsv(input, na=c("", "NA"))
 
 #Ensure columns holding metrics are numeric
