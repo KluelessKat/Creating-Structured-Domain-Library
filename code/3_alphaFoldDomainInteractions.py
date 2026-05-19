@@ -14,24 +14,61 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # Fragment helpers
 # ---------------------------------------------------------------------------
-# AlphaFold DB splits proteins > ~1400 AA into overlapping fragments.
-# Each fragment is 1400 AA long with a 200 AA overlap → step = 1200 AA.
-# Fragment PDB files use LOCAL residue numbering (1 to ~1400), NOT global
-# UniProt positions.  Convert before any residue-based calculation.
-#   F1: global  1–1400  → local offset 0
-#   F2: global  1201–2600 → local offset 1200
-#   F3: global  2401–3800 → local offset 2400  …
-FRAG_STEP = 1200
+# AF DB splits proteins >2700 AA into overlapping 1400-AA fragments (step=200).
+# Proteins <=2700 AA are never fragmented — F1 covers the full chain.
+# Fragment PDB files use LOCAL residue numbering (1 to ~1400).
+# F1: global 1-1400 (offset 0), F2: global 201-1600 (offset 200), etc.
+FRAG_STEP = 200  # AA step between consecutive fragment start positions
 
-def getAFFragment(domainStart):
-    '''Return the AlphaFold fragment number that contains the given global residue.'''
-    if domainStart <= 1400:
+# Standard 3-letter → 1-letter amino acid lookup (used for sequence verification)
+_AA3TO1 = {
+    'ALA':'A','ARG':'R','ASN':'N','ASP':'D','CYS':'C',
+    'GLN':'Q','GLU':'E','GLY':'G','HIS':'H','ILE':'I',
+    'LEU':'L','LYS':'K','MET':'M','PHE':'F','PRO':'P',
+    'SER':'S','THR':'T','TRP':'W','TYR':'Y','VAL':'V',
+    'SEC':'U','PYL':'O','ASX':'B','GLX':'Z','XLE':'J','UNK':'X',
+}
+
+def getAFFragment(domainStart, domainEnd, proteinLength):
+    '''Return the AF fragment number containing [domainStart, domainEnd].
+    Proteins <=2700 AA are not fragmented (always F1, local = global).
+    For fragmented proteins: step=200, F1=1-1400, F2=201-1600, ...
+    Returns None if the domain spans a boundary and cannot fit in one fragment.'''
+    if proteinLength <= 2700:
         return 1
-    return math.ceil(domainStart / FRAG_STEP)
+    # Smallest n where (n-1)*200 + 1400 >= domainEnd
+    n = max(1, math.ceil((domainEnd - 1400) / FRAG_STEP) + 1)
+    # Verify domainStart also fits inside fragment n
+    if (n - 1) * FRAG_STEP + 1 > domainStart:
+        return None  # domain spans a fragment boundary
+    return n
 
 def globalToLocal(pos, fragment):
-    '''Convert a global UniProt residue position to a local fragment position.'''
+    '''Convert a global UniProt residue position to a local fragment position.
+    F1: offset 0 (local = global), F2: offset 200, F3: offset 400, ...'''
     return pos - (fragment - 1) * FRAG_STEP
+
+def verifyDomainInFragment(pdbFile, localStart, domainSeq, nCheck=5):
+    '''Confirm first nCheck residues of domainSeq match PDB residues at localStart.
+    Uses BioPython. Returns True on match or if verification cannot be performed.'''
+    try:
+        parser = PDB.PDBParser(QUIET=True)
+        structure = parser.get_structure("verify", pdbFile)
+        chain = next(structure[0].get_chains())
+        pdbResidues = {}
+        for res in chain:
+            rid = res.id[1]
+            if localStart <= rid < localStart + nCheck:
+                pdbResidues[rid] = _AA3TO1.get(res.resname, 'X')
+        pdbSeqStr   = ''.join(pdbResidues.get(r, '?') for r in range(localStart, localStart + nCheck))
+        domainCheck = domainSeq[:nCheck].upper()
+        if '?' not in pdbSeqStr and pdbSeqStr == domainCheck:
+            return True
+        print(f"  Sequence mismatch at local {localStart}: PDB '{pdbSeqStr}' vs domain '{domainCheck}'")
+        return False
+    except Exception as e:
+        print(f"  Warning: sequence verification failed ({e}); proceeding without check")
+        return True
 
 def _ensureUnzipped(gzPath, destPath):
     '''Decompress gzPath → destPath (skipped if destPath already exists). Returns destPath.'''
@@ -51,8 +88,8 @@ def getAlphaFoldFiles(uniprotID, fragment, outputDir):
 
     # Determine canonical output paths for unzipped files
     if fragment == 1:
-        pdbDest = os.path.join(outputDir, f"{uniprotID}_model.pdb")
-        paeDest = os.path.join(outputDir, f"{uniprotID}_PAE.json")
+        pdbDest = os.path.join(outputDir, f"{uniprotID}_F1_model.pdb")
+        paeDest = os.path.join(outputDir, f"{uniprotID}_F1_PAE.json")
     else:
         pdbDest = os.path.join(outputDir, f"AF-{uniprotID}-F{fragment}-model_v6.pdb")
         paeDest = os.path.join(outputDir, f"AF-{uniprotID}-F{fragment}-PAE.json")
@@ -166,6 +203,11 @@ def contactDensity(pdbFile, domainStart, domainEnd):
     domainResidues=[res for res in proteinChain if domainStart <= res.get_id()[1] <= domainEnd]
     otherResidues=[res for res in proteinChain if res.get_id()[1] < domainStart or res.get_id()[1] > domainEnd]
 
+    if not domainResidues or not otherResidues:
+        print(f"  contactDensity: no {'domain' if not domainResidues else 'non-domain'} residues found "
+              f"(local {domainStart}-{domainEnd}); returning NaN")
+        return float('nan')
+
     cutoff=4.0
     totalContacts=0
     for domainResidue in domainResidues:
@@ -175,7 +217,8 @@ def contactDensity(pdbFile, domainStart, domainEnd):
             if np.any(cdist(domainCoordinates, otherCoordinates) < cutoff):
                 totalContacts+=1
 
-    return totalContacts/(len(domainResidues)*len(otherResidues))
+    #return totalContacts/(len(domainResidues)*len(otherResidues))
+    return totalContacts/len(domainResidues)
 
 def plddtMean(domainPDBFile):
     '''Returns the mean pLDDT (B-factor) of all residues in the domain PDB.'''
@@ -225,15 +268,24 @@ for idx, sequence in df.iterrows():
     domainEnd=sequence["End"]
 
     # Determine which AF fragment contains this domain and convert to local coords
-    fragment=getAFFragment(domainStart)
+    proteinLength=int(sequence["Length"])
+    fragment=getAFFragment(domainStart, domainEnd, proteinLength)
+    if fragment is None:
+        print(f"  Skipping {sequence['Entry']} domain {domainStart}-{domainEnd}: "
+              f"spans a fragment boundary (domain may be longer than 1200 AA).")
+        continue
     localStart=globalToLocal(domainStart, fragment)
     localEnd=globalToLocal(domainEnd, fragment)
     print(f"Processing {sequence['Entry']} domain {domainStart}-{domainEnd} "
-          f"(F{fragment}, local {localStart}-{localEnd})")
+          f"(protein length {proteinLength}, F{fragment}, local {localStart}-{localEnd})")
 
     paeFile, PDBFile=getAlphaFoldFiles(sequence["Entry"], fragment, outputDir)
-    if not paeFile or not PDBFile:
-        continue
+    if not PDBFile:
+        continue  # cannot proceed without the structure file
+    if not paeFile:
+        print(f"  PAE file unavailable for {sequence['Entry']} F{fragment} "
+              f"(expected for F2+ of proteins >2700 AA). "
+              f"anchoringIndex will be NaN; other metrics will still be computed.")
 
     parser=PDB.PDBParser(QUIET=True)
     fullProtein=parser.get_structure("protein", PDBFile)
@@ -245,25 +297,43 @@ for idx, sequence in df.iterrows():
               f"(1-{fragmentLength}). Check FRAG_STEP constant.")
         continue
 
-    domainPDBFile=os.path.join(outputDir, f"{sequence['Entry']}_domain_model.pdb")
+    domainPDBFile=os.path.join(outputDir, f"{sequence['Entry']}_F{fragment}_{localStart}_{localEnd}_domain.pdb")
     exciseDomainPDB(PDBFile, domainPDBFile, localStart, localEnd)
 
-    plddt=plddtMean(domainPDBFile)
-    df.at[idx, "meanDomainplddt"]=plddt
-    if plddt>=80:
-        df.at[idx, "anchoringIndex"]=anchoringIndex(paeFile, localStart, localEnd)
-        df.at[idx, "fractionBuried"]=fractionBuried(PDBFile, domainPDBFile, localStart, localEnd)
-        df.at[idx, "contactDensity"]=contactDensity(PDBFile, localStart, localEnd)
-        df.at[idx, "interactionIndex"]=(0.247*df.at[idx, "anchoringIndex"])+(0.565*df.at[idx, "fractionBuried"])+(0.187*df.at[idx, "contactDensity"])
+    # Verify that the first 5 residues of the domain sequence match the PDB
+    if not verifyDomainInFragment(PDBFile, localStart, str(sequence["Domain Sequence"])):
+        print(f"  WARNING: Sequence mismatch for {sequence['Entry']}. "
+              f"Check fragment/length logic. Proceeding with caution.")
 
-df_kept=df[(df["meanDomainplddt"]>=80)].copy()
+    #plddt=plddtMean(domainPDBFile)
+    #df.at[idx, "meanDomainplddt"]=plddt
+    # pLDDT >= 80 filtering is already applied in step 2; compute metrics for all domains here
+    # if plddt>=80:
+    fb=fractionBuried(PDBFile, domainPDBFile, localStart, localEnd)
+    cd=contactDensity(PDBFile, localStart, localEnd)
+    df.at[idx, "fractionBuried"]=fb
+    df.at[idx, "contactDensity"]=cd
+    if paeFile:
+        ai=anchoringIndex(paeFile, localStart, localEnd)
+        df.at[idx, "anchoringIndex"]=ai
+        # Full formula: weights sum to 1.0 (0.247 + 0.565 + 0.187 ≈ 0.999)
+        df.at[idx, "interactionIndex"]=(0.247*ai)+(0.565*fb)+(0.187*cd)
+    else:
+        # PAE unavailable (F2+ of proteins >2700 AA): reweight over fb and cd only
+        # Normalise original fb/cd weights: 0.565/(0.565+0.187) ≈ 0.751, 0.187/0.752 ≈ 0.249
+        df.at[idx, "interactionIndex"]=(0.751*fb)+(0.249*cd)
+
+# Split on interactionIndex: domains where it could not be computed are eliminated
+# (pLDDT >= 80 filtering is already applied in step 2 and is not repeated here)
+# df_kept=df[(df["meanDomainplddt"]>=80)].copy()
+df_kept=df[df["interactionIndex"].notna()].copy()
 df_eliminated=df[~df.index.isin(df_kept.index)].copy()
 
 outputPath=Path(output)
 elimOutput=str(outputPath.with_name(outputPath.stem + '_eliminated' + outputPath.suffix))
 df_eliminated.to_csv(elimOutput, sep='\t', index=False)
 
-print(f"{len(df_kept)} domain sequences kept after pLDDT filtering (>= 80)")
+print(f"{len(df_kept)} domain sequences kept after interaction index filter")
 print(f"{len(df_eliminated)} domain sequences eliminated; saved to {elimOutput}")
 df_kept.to_csv(output, sep='\t', index=False)
 print(f"Saved domain sequences to {output}")

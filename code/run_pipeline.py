@@ -39,7 +39,7 @@ These are forwarded verbatim to every step that is run.
 
 NOTES
 -----
-- Steps 1–4 and 6 are Python; step 5 is R (requires Rscript on PATH).
+- All steps are Python (steps 1–6).
 - Steps 3 and 4 download / read AlphaFold PDB and PAE files. Use --af-dir
   to point at an existing cache and avoid re-downloading. In pipeline mode,
   --af-dir defaults to <output-dir>/alphafold_files.
@@ -71,7 +71,7 @@ STEP_NAMES = {
     2: "Disorder Prediction + pLDDT Filter",
     3: "AlphaFold Domain Interactions",
     4: "Physical Property Calculation",
-    5: "Final Candidate Sequences (R)",
+    5: "Final Candidate Sequences",
     6: "PyMOL Structure Images",
 }
 
@@ -157,10 +157,9 @@ def run_step4(inp: Path, output: Path, af_dir: Path, extra: list[str]) -> int:
 
 
 def run_step5(inp: Path, output: Path, extra: list[str]) -> int:
-    return _run(["Rscript",
-                 str(CODE_DIR / "5_obtainFinalCandidateSequences.R"),
-                 str(inp), str(output),
-                 *extra])
+    return _run(_python("5_obtainFinalCandidateSequences.py",
+                        str(inp), str(output),
+                        *extra))
 
 
 def run_step6(inp: Path, output_dir: Path, extra: list[str]) -> int:

@@ -7,6 +7,23 @@ from PIL import Image, ImageDraw, ImageFont
 import pandas as pd
 import os
 
+# ---------------------------------------------------------------------------
+# AlphaFold fragment constants
+# ---------------------------------------------------------------------------
+# AF DB splits proteins >2700 AA into overlapping 1400-AA fragments (step=200).
+# Proteins <=2700 AA use F1 only (local = global, no offset).
+# F1: global 1-1400, F2: global 201-1600, F3: global 401-1800, ...
+FRAG_STEP = 200
+
+# Standard 3-letter → 1-letter amino acid lookup
+_AA3TO1 = {
+    'ALA':'A','ARG':'R','ASN':'N','ASP':'D','CYS':'C',
+    'GLN':'Q','GLU':'E','GLY':'G','HIS':'H','ILE':'I',
+    'LEU':'L','LYS':'K','MET':'M','PHE':'F','PRO':'P',
+    'SER':'S','THR':'T','TRP':'W','TYR':'Y','VAL':'V',
+    'SEC':'U','PYL':'O','ASX':'B','GLX':'Z','XLE':'J','UNK':'X',
+}
+
 def findLocalPDB(entry, fragment, afDir):
     '''Search afDir for a cached AlphaFold PDB before hitting the web.
     Checks both uncompressed (.pdb) and gzipped (.pdb.gz) files.
@@ -44,39 +61,74 @@ def findLocalPDB(entry, fragment, afDir):
 
     return None, False
 
-def getAFFragment(start):
-    '''Return the AlphaFold fragment number that contains the given residue.
-    AF fragments are 1400 AA long with 200 AA overlap (step = 1200 AA).
-    F1: 1-1400, F2: 1201-2600, F3: 2401-3800, etc.'''
-    if start <= 1400:
+def getAFFragment(domainStart, domainEnd, proteinLength):
+    '''Return the AF fragment number containing [domainStart, domainEnd].
+    Proteins <=2700 AA are not fragmented (always F1, local = global).
+    For fragmented proteins: step=200, F1=1-1400, F2=201-1600, ...
+    Returns None if the domain spans a boundary and cannot fit in one fragment.'''
+    if proteinLength <= 2700:
         return 1
-    return math.ceil(start / 1200)
+    n = max(1, math.ceil((domainEnd - 1400) / FRAG_STEP) + 1)
+    if (n - 1) * FRAG_STEP + 1 > domainStart:
+        return None
+    return n
 
-def takePymolImage(pdbFile, start, end, output, fragment=1):
-    '''Take an image of a given protein with a specified domain highlighted in pymol.
-    AF fragment PDB files use local residue numbering (1 to ~1400), not global UniProt
-    positions. Convert global coords to local before selecting. Fragment step = 1200 AA.'''
+def globalToLocal(pos, fragment):
+    '''Convert a global UniProt residue position to a local fragment position.
+    F1: offset 0 (local = global), F2: offset 200, F3: offset 400, ...'''
+    return pos - (fragment - 1) * FRAG_STEP
 
-    #Load pymol and the protein
+def _quickVerifySeq(pdbPath, localStart, domainSeq, nCheck=5):
+    '''Scan a local PDB file and confirm the first nCheck residues at localStart
+    match domainSeq. Pure line parsing — no BioPython required.
+    Non-blocking: returns True on read errors or for URL paths.'''
+    if pdbPath.startswith('http'):
+        return True  # cannot verify without downloading the full file
+    resnames = {}
+    try:
+        opener = gzip.open if pdbPath.endswith('.gz') else open
+        with opener(pdbPath, 'rt', errors='ignore') as fh:
+            for line in fh:
+                if not line.startswith('ATOM'):
+                    continue
+                if line[12:16].strip() != 'CA':
+                    continue
+                try:
+                    resnum = int(line[22:26])
+                except ValueError:
+                    continue
+                if localStart <= resnum < localStart + nCheck:
+                    resnames[resnum] = _AA3TO1.get(line[17:20].strip(), 'X')
+                elif resnum >= localStart + nCheck:
+                    break
+    except Exception:
+        return True  # non-blocking on read failure
+    pdbSeq   = ''.join(resnames.get(r, '?') for r in range(localStart, localStart + nCheck))
+    expected = domainSeq[:nCheck].upper()
+    if '?' not in pdbSeq and pdbSeq == expected:
+        return True
+    print(f"  WARNING: Seq check failed — PDB local {localStart}–{localStart+nCheck-1} "
+          f"= '{pdbSeq}', domain = '{expected}'")
+    return False
+
+def takePymolImage(pdbFile, localStart, localEnd, globalStart, globalEnd, output, fragment=1):
+    '''Render a PyMOL image of the protein with the domain highlighted.
+    localStart/localEnd are the LOCAL fragment residue numbers (1 to ~1400).
+    globalStart/globalEnd are shown in the error message for debugging only.'''
+
     cmd.reinitialize()
     cmd.load(pdbFile, "fullProtein")
     cmd.color("green", "fullProtein")
 
-    #Convert global domain coords to local fragment coords (F1: no change, F2+: subtract offset)
-    fragmentOffset = (fragment - 1) * 1200
-    localStart = start - fragmentOffset
-    localEnd   = end   - fragmentOffset
-
-    #Highlight the domain red and center and zoom in on it
     cmd.select("domain", f"resi {localStart}-{localEnd}")
     if cmd.count_atoms("domain") == 0:
-        raise ValueError(f"Domain residues {start}-{end} (local {localStart}-{localEnd}) "
-                         f"not found in fragment F{fragment}. Check fragment step size.")
+        raise ValueError(
+            f"Domain residues (global {globalStart}-{globalEnd}, local {localStart}-{localEnd}) "
+            f"not found in fragment F{fragment}. Sequence verification may have failed.")
     cmd.color("red", "domain")
     cmd.orient("domain")
     cmd.zoom("domain", buffer=100)
 
-    #Take an image
     cmd.set("ray_opaque_background", 0)
     cmd.ray(1200, 1200)
     cmd.png(output, dpi=300)
@@ -166,22 +218,36 @@ print(f"Imaging {len(df)} domain(s).")
 
 entriesDictionary={}
 for entry, group in df.groupby('Entry'):#Record relevant info for each domain sequence to help create annotations
-    entriesDictionary[entry]=group[['Domain', 'Domain Sequence', 'Start', 'End']].values.tolist()
+    entriesDictionary[entry]=group[['Domain', 'Domain Sequence', 'Start', 'End', 'Length']].values.tolist()
 
-    #entriesDictionary[entry]=group[['Domain', 'Domain Sequence', 'Start', 'End', 'candidateSequence']].values.tolist()
- 
 imagePaths=[]
 annotations=[]
-for entry, rows in entriesDictionary.items():#Go through each protein 
+for entry, rows in entriesDictionary.items():#Go through each protein
     for row in rows: #Go through each domain of a protein
-        domain, domainSeq, start, end = row#, driverClass=row
-        fragment=getAFFragment(start)
-        print(f"Imaging {entry} (domain {start}-{end}, AF fragment F{fragment})")
+        domain, domainSeq, start, end, length = row
+
+        # Determine fragment and convert to local coords using protein length
+        fragment=getAFFragment(int(start), int(end), int(length))
+        if fragment is None:
+            print(f"  Skipping {entry} domain {start}-{end}: spans a fragment boundary.")
+            continue
+        localStart=globalToLocal(int(start), fragment)
+        localEnd  =globalToLocal(int(end),   fragment)
+        print(f"Imaging {entry} (protein length {int(length)}, domain {start}-{end}, "
+              f"AF F{fragment}, local {localStart}-{localEnd})")
+
         localPath, isTemp=findLocalPDB(entry, fragment, _args.af_dir)
         pdbFile=localPath if localPath else f"https://alphafold.ebi.ac.uk/files/AF-{entry}-F{fragment}-model_v6.pdb"
-        output=os.path.join(imagesDir, f"{entry}_{start}_{end}.png") #Specify the folder that will hold individual images
+
+        # Safety check: verify first 5 residues match before rendering
+        if localPath and not _quickVerifySeq(pdbFile, localStart, str(domainSeq)):
+            print(f"  WARNING: Sequence mismatch for {entry} F{fragment} — "
+                  f"check fragment/length logic. Proceeding with caution.")
+
+        output=os.path.join(imagesDir, f"{entry}_{start}_{end}.png")
         try:
-            takePymolImage(pdbFile, start, end, output, fragment=fragment)
+            takePymolImage(pdbFile, localStart, localEnd, int(start), int(end),
+                           output, fragment=fragment)
         except Exception as e:
             print(f"  WARNING: Skipping {entry} ({start}-{end}) — {e}")
             if isTemp and os.path.exists(pdbFile):

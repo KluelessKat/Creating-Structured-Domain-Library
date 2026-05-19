@@ -13,15 +13,58 @@ from neurosnap.io.pdb import parse_pdb
 # ---------------------------------------------------------------------------
 # Fragment helpers (mirrors step 3 — AF fragments use local residue numbering)
 # ---------------------------------------------------------------------------
-FRAG_STEP = 1200
+# AF DB splits proteins >2700 AA into overlapping 1400-AA fragments (step=200).
+# Proteins <=2700 AA are never fragmented — F1 covers the full chain.
+# F1: global 1-1400 (offset 0), F2: global 201-1600 (offset 200), etc.
+FRAG_STEP = 200  # AA step between consecutive fragment start positions
 
-def getAFFragment(domainStart):
-    if domainStart <= 1400:
+# Standard 3-letter → 1-letter amino acid lookup (used for sequence verification)
+_AA3TO1 = {
+    'ALA':'A','ARG':'R','ASN':'N','ASP':'D','CYS':'C',
+    'GLN':'Q','GLU':'E','GLY':'G','HIS':'H','ILE':'I',
+    'LEU':'L','LYS':'K','MET':'M','PHE':'F','PRO':'P',
+    'SER':'S','THR':'T','TRP':'W','TYR':'Y','VAL':'V',
+    'SEC':'U','PYL':'O','ASX':'B','GLX':'Z','XLE':'J','UNK':'X',
+}
+
+def getAFFragment(domainStart, domainEnd, proteinLength):
+    '''Return the AF fragment number containing [domainStart, domainEnd].
+    Proteins <=2700 AA are not fragmented (always F1, local = global).
+    For fragmented proteins: step=200, F1=1-1400, F2=201-1600, ...
+    Returns None if the domain spans a boundary and cannot fit in one fragment.'''
+    if proteinLength <= 2700:
         return 1
-    return math.ceil(domainStart / FRAG_STEP)
+    n = max(1, math.ceil((domainEnd - 1400) / FRAG_STEP) + 1)
+    if (n - 1) * FRAG_STEP + 1 > domainStart:
+        return None
+    return n
 
 def globalToLocal(pos, fragment):
+    '''Convert a global UniProt residue position to a local fragment position.
+    F1: offset 0 (local = global), F2: offset 200, F3: offset 400, ...'''
     return pos - (fragment - 1) * FRAG_STEP
+
+def verifyDomainInFragment(pdbFile, localStart, domainSeq, nCheck=5):
+    '''Confirm first nCheck residues of domainSeq match PDB residues at localStart.
+    Uses BioPython. Returns True on match or if verification cannot be performed.'''
+    try:
+        parser = PDB.PDBParser(QUIET=True)
+        structure = parser.get_structure("verify", pdbFile)
+        chain = next(structure[0].get_chains())
+        pdbResidues = {}
+        for res in chain:
+            rid = res.id[1]
+            if localStart <= rid < localStart + nCheck:
+                pdbResidues[rid] = _AA3TO1.get(res.resname, 'X')
+        pdbSeqStr   = ''.join(pdbResidues.get(r, '?') for r in range(localStart, localStart + nCheck))
+        domainCheck = domainSeq[:nCheck].upper()
+        if '?' not in pdbSeqStr and pdbSeqStr == domainCheck:
+            return True
+        print(f"  Sequence mismatch at local {localStart}: PDB '{pdbSeqStr}' vs domain '{domainCheck}'")
+        return False
+    except Exception as e:
+        print(f"  Warning: sequence verification failed ({e}); proceeding without check")
+        return True
 
 def _ensureUnzipped(gzPath, destPath):
     if not os.path.exists(destPath):
@@ -156,16 +199,28 @@ df["positiveSurfaceFraction"]=None
 df["negativeSurfaceFraction"]=None
 
 for idx, sequence in df.iterrows():#Go through each domain sequence and calculate physical properties
-    pdbFile=os.path.join(pdbFileDir, f"{sequence['Entry']}_domain_model.pdb")
+    # Always resolve fragment + local coords first so the filename is domain-specific
+    proteinLength=int(sequence["Length"])
+    fragment=getAFFragment(int(sequence["Start"]), int(sequence["End"]), proteinLength)
+    if fragment is None:
+        print(f"  Skipping {sequence['Entry']}: domain spans a fragment boundary.")
+        continue
+    localStart=globalToLocal(sequence["Start"], fragment)
+    localEnd=globalToLocal(sequence["End"], fragment)
+
+    pdbFile=os.path.join(pdbFileDir, f"{sequence['Entry']}_F{fragment}_{localStart}_{localEnd}_domain.pdb")
 
     if not os.path.exists(pdbFile):
-        # Domain PDB not found — try to build it from the correct AF fragment
-        fragment=getAFFragment(sequence["Start"])
-        localStart=globalToLocal(sequence["Start"], fragment)
-        localEnd=globalToLocal(sequence["End"], fragment)
-        print(f"Domain PDB missing for {sequence['Entry']}; fetching F{fragment} to extract domain {sequence['Start']}-{sequence['End']} (local {localStart}-{localEnd})")
+        # Domain PDB not yet excised — fetch the AF fragment and extract it
+        print(f"Domain PDB missing for {sequence['Entry']}; fetching F{fragment} "
+              f"(protein length {proteinLength}) to extract domain "
+              f"{sequence['Start']}-{sequence['End']} (local {localStart}-{localEnd})")
         fragmentPDB=fetchFragmentPDB(sequence["Entry"], fragment, pdbFileDir)
         if fragmentPDB:
+            # Verify sequence before excising
+            if not verifyDomainInFragment(fragmentPDB, localStart, str(sequence["Domain Sequence"])):
+                print(f"  WARNING: Sequence mismatch for {sequence['Entry']}. "
+                      f"Check fragment/length logic. Proceeding with caution.")
             exciseDomain(fragmentPDB, pdbFile, localStart, localEnd)
         if not os.path.exists(pdbFile):
             print(f"  Skipping {sequence['Entry']}: could not obtain domain PDB")

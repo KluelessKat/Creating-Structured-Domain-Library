@@ -4,10 +4,10 @@ import re
 
 ap = argparse.ArgumentParser(description='Step 1: Extract domain sequences from a UniProt proteome TSV.')
 ap.add_argument('--input',
-                default='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/jpl_code/Creating-Structured-Domain-Library/humanProteome_KZ.tsv',
+                default='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/humanProteome_KZ.tsv',
                 help='Input UniProt proteome TSV (hardcoded default)')
 ap.add_argument('--output',
-                default='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/jpl_code/Creating-Structured-Domain-Library/1_domainLibraryRaw.tsv',
+                default='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/kat_output_library_files/1_domainLibraryRaw.tsv',
                 help='Output TSV path')
 _args = ap.parse_args()
 input  = _args.input
@@ -48,8 +48,8 @@ for idx, entry in df.iterrows():#Go through each protein in the proteome to coll
 
 dfOutput=pd.DataFrame(outputEntries)
 print(f"{len(dfOutput)} domain sequences before filtering")
-dfOutput=dfOutput[(dfOutput["Domain Length"]<=66)].copy() #Because of experimental limitations, we filter out any domain sequence longer than 66 aa. 
-print(f"{len(dfOutput)} domain sequences after domain sequence length filtering")
+#dfOutput=dfOutput[(dfOutput["Domain Length"]<=66)].copy() #Because of experimental limitations, we filter out any domain sequence longer than 66 aa. 
+#print(f"{len(dfOutput)} domain sequences after domain sequence length filtering")
 dfOutput['Domain']=dfOutput['Domain'].apply(lambda s: re.sub(r'\s*\d+$', '', s))#Clean domain names by removing trailing numbers
 
 dfOutput.to_csv(output, sep="\t", index=False)

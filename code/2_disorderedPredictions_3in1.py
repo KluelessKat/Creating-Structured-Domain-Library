@@ -72,21 +72,51 @@ import requests
 # ---------------------------------------------------------------------------
 # AlphaFold fragment helpers
 # ---------------------------------------------------------------------------
-# AF DB splits proteins >1400 AA into overlapping 1400-AA fragments (step=1200).
+# AF DB splits proteins >2700 AA into overlapping 1400-AA fragments (step=200).
+# Proteins <=2700 AA are never fragmented — F1 covers the full chain.
 # Fragment PDB files use LOCAL residue numbering (1 to ~1400).
-# F1: global 1-1400 (offset 0), F2: global 1201-2600 (offset 1200), etc.
+# F1: global 1-1400 (offset 0), F2: global 201-1600 (offset 200), etc.
 
-FRAG_STEP = 1200
+FRAG_STEP = 200  # AA step between consecutive fragment start positions
 
-def getAFFragment(domainStart: int) -> int:
-    '''Return the AF fragment number whose local coords contain domainStart.'''
-    if domainStart <= 1400:
+# Standard 3-letter → 1-letter amino acid lookup (used for sequence verification)
+_AA3TO1 = {
+    'ALA':'A','ARG':'R','ASN':'N','ASP':'D','CYS':'C',
+    'GLN':'Q','GLU':'E','GLY':'G','HIS':'H','ILE':'I',
+    'LEU':'L','LYS':'K','MET':'M','PHE':'F','PRO':'P',
+    'SER':'S','THR':'T','TRP':'W','TYR':'Y','VAL':'V',
+    'SEC':'U','PYL':'O','ASX':'B','GLX':'Z','XLE':'J','UNK':'X',
+}
+
+def getAFFragment(domainStart: int, domainEnd: int, proteinLength: int) -> Optional[int]:
+    '''Return the AF fragment number containing [domainStart, domainEnd].
+    Proteins <=2700 AA are not fragmented (always F1, local = global).
+    For fragmented proteins: step=200, F1=1-1400, F2=201-1600, ...
+    Returns None if the domain is too long to fit in any single fragment.'''
+    if proteinLength <= 2700:
         return 1
-    return math.ceil(domainStart / FRAG_STEP)
+    # Smallest n where (n-1)*200 + 1400 >= domainEnd
+    n = max(1, math.ceil((domainEnd - 1400) / FRAG_STEP) + 1)
+    # Verify domainStart also fits inside fragment n
+    if (n - 1) * FRAG_STEP + 1 > domainStart:
+        return None  # domain spans a fragment boundary; cannot fit in one fragment
+    return n
 
 def globalToLocal(pos: int, fragment: int) -> int:
-    '''Convert a global UniProt residue position to a local fragment position.'''
+    '''Convert a global UniProt residue position to a local fragment position.
+    F1: offset 0 (local = global), F2: offset 200, F3: offset 400, ...'''
     return pos - (fragment - 1) * FRAG_STEP
+
+def _verifyDomainSeq(resnames: dict, localStart: int,
+                     domainSeq: str, nCheck: int = 5) -> bool:
+    '''Check first nCheck residues of domainSeq against already-parsed resnames dict.
+    Returns True on match, False (with a printed warning) on mismatch.'''
+    pdbSeq   = ''.join(resnames.get(r, '?') for r in range(localStart, localStart + nCheck))
+    expected = domainSeq[:nCheck].upper()
+    if '?' not in pdbSeq and pdbSeq == expected:
+        return True
+    print(f"  Sequence mismatch at local {localStart}: PDB '{pdbSeq}' vs domain '{expected}'")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -176,14 +206,17 @@ def load_iupred3(iupred3_dir: Optional[Path],
 # lines, so nothing is written to disk. Results are cached in memory keyed by
 # UniProt ID so each protein is fetched at most once per run.
 
-# Cache keyed by (uniprot_id, fragment) so each fragment is fetched at most once.
-_plddt_cache: dict[tuple[str, int], Optional[dict[int, float]]] = {}
+# Cache keyed by (uniprot_id, fragment).
+# Value: None  → network failure
+#        (bfactors, resnames) tuple  → success (may be empty dicts for 404)
+_plddt_cache: dict[tuple[str, int], Optional[tuple[dict, dict]]] = {}
 
 
-def _parse_pdb_ca_bfactors(lines) -> dict[int, float]:
+def _parse_pdb_ca_bfactors(lines) -> tuple[dict, dict]:
     '''Parse CA ATOM lines from an iterable of PDB lines (str or bytes).
-    Returns {local_resnum: pLDDT}.'''
-    result: dict[int, float] = {}
+    Returns ({local_resnum: pLDDT}, {local_resnum: 1-letter AA}).'''
+    bfactors: dict[int, float] = {}
+    resnames: dict[int, str]   = {}
     for raw in lines:
         line = raw.decode("ascii", errors="ignore") if isinstance(raw, bytes) else raw
         if not line.startswith("ATOM"):
@@ -193,19 +226,21 @@ def _parse_pdb_ca_bfactors(lines) -> dict[int, float]:
         try:
             resnum  = int(line[22:26])
             bfactor = float(line[60:66])
+            resname = _AA3TO1.get(line[17:20].strip(), 'X')
         except ValueError:
             continue
-        if resnum not in result:
-            result[resnum] = bfactor
-    return result
+        if resnum not in bfactors:
+            bfactors[resnum] = bfactor
+            resnames[resnum] = resname
+    return bfactors, resnames
 
 
 def _fetch_plddt_for_fragment(uniprot_id: str, fragment: int,
                                af_dir: Optional[Path] = None
-                               ) -> Optional[dict[int, float]]:
-    """Return {local_resnum: pLDDT} for the given entry + fragment.
+                               ) -> Optional[tuple[dict, dict]]:
+    """Return (bfactors, resnames) dicts for the given entry + fragment.
     Checks af_dir first (unzipped or .gz), then falls back to AlphaFold EBI.
-    Returns None on network failure, empty dict on 404 (no AF model).
+    Returns None on network failure, ({}, {}) on 404 (no AF model).
     """
     cache_key = (uniprot_id, fragment)
     if cache_key in _plddt_cache:
@@ -231,8 +266,8 @@ def _fetch_plddt_for_fragment(uniprot_id: str, fragment: int,
                 else:
                     with open(path, 'r', errors='ignore') as fh:
                         result = _parse_pdb_ca_bfactors(fh)
-                _plddt_cache[cache_key] = result or {}
-                return _plddt_cache[cache_key]
+                _plddt_cache[cache_key] = result
+                return result
 
     # --- 2. Fall back to AlphaFold EBI URL ----------------------------------
     url = (f"https://alphafold.ebi.ac.uk/files/"
@@ -240,8 +275,8 @@ def _fetch_plddt_for_fragment(uniprot_id: str, fragment: int,
     try:
         r = requests.get(url, timeout=30, stream=True)
         if r.status_code == 404:
-            _plddt_cache[cache_key] = {}
-            return {}
+            _plddt_cache[cache_key] = ({}, {})
+            return ({}, {})
         r.raise_for_status()
     except requests.RequestException as e:
         warnings.warn(f"pLDDT fetch failed for {uniprot_id} F{fragment}: {e}")
@@ -249,25 +284,38 @@ def _fetch_plddt_for_fragment(uniprot_id: str, fragment: int,
         return None
 
     result = _parse_pdb_ca_bfactors(r.iter_lines())
-    _plddt_cache[cache_key] = result or {}
-    return _plddt_cache[cache_key]
+    _plddt_cache[cache_key] = result
+    return result
 
 
 def score_plddt_domain(uniprot_id: str, dstart: int, dend: int,
+                        proteinLength: int,
+                        domainSeq: Optional[str] = None,
                         af_dir: Optional[Path] = None) -> Optional[float]:
     """Return mean pLDDT over domain residues [dstart, dend] (global, 1-indexed).
-    Automatically picks the correct AF fragment and converts to local coords.
+    Picks the correct AF fragment based on protein length, converts to local coords,
+    and optionally verifies the first 5 residues against domainSeq.
     Returns None if the fragment cannot be fetched or no CA atoms fall in range.
     """
-    fragment   = getAFFragment(dstart)
+    fragment = getAFFragment(dstart, dend, proteinLength)
+    if fragment is None:
+        print(f"  Warning: domain {dstart}-{dend} spans a fragment boundary; skipping pLDDT.")
+        return None
     localStart = globalToLocal(dstart, fragment)
     localEnd   = globalToLocal(dend,   fragment)
 
-    frag_plddt = _fetch_plddt_for_fragment(uniprot_id, fragment, af_dir)
-    if not frag_plddt:
+    frag_result = _fetch_plddt_for_fragment(uniprot_id, fragment, af_dir)
+    if frag_result is None:
         return None
-    scores = [frag_plddt[r] for r in range(localStart, localEnd + 1)
-              if r in frag_plddt]
+    bfactors, resnames = frag_result
+    if not bfactors:
+        return None
+
+    # Sequence verification: confirm first 5 residues match before trusting coords
+    if domainSeq and resnames:
+        _verifyDomainSeq(resnames, localStart, domainSeq)
+
+    scores = [bfactors[r] for r in range(localStart, localEnd + 1) if r in bfactors]
     if not scores:
         return None
     return float(np.mean(scores))
@@ -583,6 +631,8 @@ def main():
             plddt_scores.append(
                 score_plddt_domain(str(row['Entry']),
                                    int(row['Start']), int(row['End']),
+                                   int(row['Length']),
+                                   domainSeq=str(row.get('Domain Sequence', '')),
                                    af_dir=af_dir))
         df['plddt_mean_domain'] = plddt_scores
 
