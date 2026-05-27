@@ -619,6 +619,17 @@ def main():
     scores_df = pd.DataFrame(results, index=df.index)
     df = pd.concat([df, scores_df], axis=1)
 
+    # --- Hardcoded AF fragment (200-step / 1400-AA algorithm) -------------
+    # Computed once here so downstream steps 3/4/6 can read it instead of
+    # recomputing. None when the domain spans a fragment boundary.
+    if all(col in df.columns for col in ('Start', 'End', 'Length')):
+        df['hardcoded_fragment'] = [
+            getAFFragment(int(s), int(e), int(L))
+            for s, e, L in zip(df['Start'], df['End'], df['Length'])
+        ]
+    else:
+        print("  Warning: Start/End/Length missing — skipping hardcoded_fragment column.")
+
     # --- Score pLDDT per domain -------------------------------------------
     if run_plddt:
         af_dir = args.af_dir

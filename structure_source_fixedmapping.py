@@ -124,6 +124,7 @@ class StructureChoice:
     available: bool = False
     source: str = "none"
     pdb_path: Optional[Path] = None
+    full_chain_pdb_path: Optional[Path] = None
     full_protein_pdb_path: Optional[Path] = None
     pae_path: Optional[Path] = None
     pdb_id: Optional[str] = None
@@ -134,6 +135,7 @@ class StructureChoice:
     domain_purity: Optional[float] = None
     tm_score: Optional[float] = None
     tm_flag: Optional[str] = None
+    loose_align_fragment: Optional[int] = None
     notes: list = field(default_factory=list)
 
     def to_row(self) -> dict:
@@ -148,6 +150,7 @@ class StructureChoice:
             "domainPurity": self.domain_purity,
             "afPdbTMScore": self.tm_score,
             "afPdbTMFlag": self.tm_flag,
+            "loose_align_fragment": self.loose_align_fragment,
             "structureNotes": "; ".join(self.notes) if self.notes else None,
         }
 
@@ -209,22 +212,58 @@ def _sifts_cache_write(cache_dir: Path, key: str, data) -> None:
 # AlphaFold file resolution (local cache + downloads, multi-fragment aware)
 # ---------------------------------------------------------------------------
 
-# Regex to recognize AF filenames in any of the standard forms:
-#   AF-{uniprot}-F{n}-model_v6.pdb
-#   AF-{uniprot}-F{n}-model_v6.pdb.gz
-#   AF-{uniprot}-F{n}-predicted_aligned_error_v6.json(.gz)
+# Regexes to recognize AF filenames in any of the standard forms we have
+# seen in the wild:
+#   1. Original AlphaFold DB:
+#        AF-{uniprot}-F{n}-model_v6.pdb[.gz]
+#        AF-{uniprot}-F{n}-predicted_aligned_error_v6.json[.gz]
+#   2. Step-3 download convention (what the rest of this pipeline writes):
+#        {uniprot}_F{n}_model.pdb[.gz]
+#        {uniprot}_F{n}_PAE.json[.gz]
+# Both forms are accepted so users can keep one --af-dir regardless of where
+# the files originally came from.
 import re as _re
-_AF_FILE_RE = _re.compile(
-    r"^AF-([A-Z0-9]+)-F(\d+)-(model|predicted_aligned_error)_(v\d+)\."
-    r"(pdb|cif|json)(\.gz)?$"
+_AF_FILE_RE_AFDB = _re.compile(
+    r"^AF-(?P<upid>[A-Z0-9]+)-F(?P<fnum>\d+)-"
+    r"(?P<ftype>model|predicted_aligned_error)_v\d+\."
+    r"(?P<ext>pdb|cif|json)(?P<gz>\.gz)?$"
 )
+_AF_FILE_RE_STEP3 = _re.compile(
+    r"^(?P<upid>[A-Z0-9]+)_F(?P<fnum>\d+)_"
+    r"(?P<ftype>model|PAE)\."
+    r"(?P<ext>pdb|json)(?P<gz>\.gz)?$"
+)
+
+
+def _match_af_filename(name: str) -> Optional[dict]:
+    """Return normalised metadata for `name` if it looks like an AF file, else
+    None. Recognises both AlphaFold-DB and step-3 naming conventions."""
+    for rx in (_AF_FILE_RE_AFDB, _AF_FILE_RE_STEP3):
+        m = rx.match(name)
+        if not m:
+            continue
+        d = m.groupdict()
+        ftype = d["ftype"]
+        # Normalise step-3's "PAE" / "model" to the AF-DB long names so the
+        # rest of the code can check a single value.
+        if ftype == "PAE":
+            ftype = "predicted_aligned_error"
+        return {
+            "uniprot": d["upid"],
+            "fragment": int(d["fnum"]),
+            "ftype": ftype,           # "model" or "predicted_aligned_error"
+            "ext": d["ext"],          # "pdb" / "json" (no .gz)
+            "gz": d.get("gz") is not None,
+        }
+    return None
 
 
 def _list_local_af_fragments(uniprot_id: str, local_dir: Path,
                              kind: str) -> dict[int, Path]:
     """Return {fragment_number: path} for AF files matching this UniProt and
     kind ('pdb' or 'pae'). Searches `local_dir` non-recursively. Files may
-    be either gzipped or not.
+    be either gzipped or not, and may follow either naming convention.
+    Prefers decompressed files when both forms are present.
     """
     if local_dir is None or not Path(local_dir).is_dir():
         return {}
@@ -232,20 +271,19 @@ def _list_local_af_fragments(uniprot_id: str, local_dir: Path,
     expected_ext = "pdb" if kind == "pdb" else "json"
     out: dict[int, Path] = {}
     for entry in Path(local_dir).iterdir():
-        m = _AF_FILE_RE.match(entry.name)
-        if not m:
+        info = _match_af_filename(entry.name)
+        if info is None:
             continue
-        upid, fnum, ftype, _ver, ext, _gz = m.groups()
-        if upid != uniprot_id:
+        if info["uniprot"] != uniprot_id:
             continue
-        if ftype != expected_ftype:
+        if info["ftype"] != expected_ftype:
             continue
-        if ext != expected_ext:
+        if info["ext"] != expected_ext:
             continue
-        # If we already have a non-gz version, prefer it; otherwise take whatever.
-        existing = out.get(int(fnum))
-        if existing is None or (existing.suffix == ".gz" and not entry.name.endswith(".gz")):
-            out[int(fnum)] = entry
+        # Prefer non-gz over gz when both are present.
+        existing = out.get(info["fragment"])
+        if existing is None or (str(existing).endswith(".gz") and not info["gz"]):
+            out[info["fragment"]] = entry
     return out
 
 
@@ -384,17 +422,57 @@ def _pick_best_fragment(uniprot_id: str,
     return None
 
 
+def _resolve_af_one_kind(uniprot_id: str, fragment: int, kind: str,
+                          af_cache: Path,
+                          local_alphafold_dir: Optional[Path],
+                          allow_download: bool) -> Optional[Path]:
+    """Resolve one AF file (pdb or pae) for one fragment, returning a
+    decompressed path. Avoids copying anything into af_cache when a
+    decompressed local file already exists in local_alphafold_dir.
+    """
+    if kind not in ("pdb", "pae"):
+        raise ValueError(f"kind must be 'pdb' or 'pae', got {kind!r}")
+    cache_name = (f"{uniprot_id}_F{fragment}_model.pdb" if kind == "pdb"
+                  else f"{uniprot_id}_F{fragment}_PAE.json")
+    cache_path = af_cache / cache_name
+
+    # 1. Previous cache hit — use it.
+    if cache_path.exists():
+        return cache_path
+
+    # 2. Look in the caller's --af-dir.
+    if local_alphafold_dir:
+        locals_ = _list_local_af_fragments(uniprot_id, local_alphafold_dir, kind)
+        local_path = locals_.get(fragment)
+        if local_path is not None:
+            if not str(local_path).endswith(".gz"):
+                # Already decompressed — use directly, no cache copy.
+                return local_path
+            # Gzipped — decompress ONCE into cache so callers get a usable
+            # path. Subsequent rows hit branch 1 above.
+            _decompress_to_cache(local_path, cache_path)
+            return cache_path if cache_path.exists() else None
+
+    # 3. Download from EBI (only when explicitly allowed).
+    if allow_download:
+        _download_af_fragment(uniprot_id, fragment, kind, cache_path)
+        return cache_path if cache_path.exists() else None
+    return None
+
+
 def resolve_alphafold(uniprot_id: str, cache_dir: Path,
                       dstart: int, dend: int,
                       local_alphafold_dir: Optional[Path] = None,
-                      allow_download: bool = True
-                      ) -> tuple[Optional[Path], Optional[Path]]:
+                      allow_download: bool = True,
+                      return_fragment: bool = False
+                      ) -> tuple:
     """Resolve the AF PDB + PAE for a domain. Picks the right fragment if
     the protein is multi-fragment. If local_alphafold_dir is given, looks
     there first (handles gzipped files); otherwise downloads.
 
     Returns (pdb_path, pae_path), each pointing into the cache dir as a
-    decompressed file. Either may be None if unavailable.
+    decompressed file. Either may be None if unavailable. When
+    return_fragment=True, returns (pdb_path, pae_path, fragment).
     """
     cache_dir = _cache_dir(cache_dir)
     af_cache = cache_dir / "alphafold"
@@ -402,31 +480,41 @@ def resolve_alphafold(uniprot_id: str, cache_dir: Path,
     fragment = _pick_best_fragment(uniprot_id, local_alphafold_dir, cache_dir,
                                    dstart, dend, allow_download=allow_download)
     if fragment is None:
-        return None, None
+        return (None, None, None) if return_fragment else (None, None)
 
-    # PDB resolution — prefer local, fall back to cache, fall back to download
-    pdb_dst = af_cache / f"{uniprot_id}_F{fragment}_model.pdb"
-    if not pdb_dst.exists():
-        local_pdbs = _list_local_af_fragments(uniprot_id, local_alphafold_dir, "pdb") \
-            if local_alphafold_dir else {}
-        if fragment in local_pdbs:
-            _decompress_to_cache(local_pdbs[fragment], pdb_dst)
-        elif allow_download:
-            _download_af_fragment(uniprot_id, fragment, "pdb", pdb_dst)
-    final_pdb = pdb_dst if pdb_dst.exists() else None
+    # PDB resolution. Priority:
+    #   1. Cached decompressed file (from a previous run).
+    #   2. Local file in local_alphafold_dir:
+    #        - already decompressed → use the local path DIRECTLY (no copy).
+    #        - gzipped              → decompress once into cache.
+    #   3. Download from EBI into cache.
+    # This avoids duplicating gigabytes of AF models into struct_cache/ when
+    # the caller has already pointed us at an --af-dir that holds them.
+    final_pdb = _resolve_af_one_kind(uniprot_id, fragment, "pdb",
+                                     af_cache, local_alphafold_dir,
+                                     allow_download)
+    final_pae = _resolve_af_one_kind(uniprot_id, fragment, "pae",
+                                     af_cache, local_alphafold_dir,
+                                     allow_download)
 
-    # PAE — same flow
-    pae_dst = af_cache / f"{uniprot_id}_F{fragment}_PAE.json"
-    if not pae_dst.exists():
-        local_paes = _list_local_af_fragments(uniprot_id, local_alphafold_dir, "pae") \
-            if local_alphafold_dir else {}
-        if fragment in local_paes:
-            _decompress_to_cache(local_paes[fragment], pae_dst)
-        elif allow_download:
-            _download_af_fragment(uniprot_id, fragment, "pae", pae_dst)
-    final_pae = pae_dst if pae_dst.exists() else None
-
+    if return_fragment:
+        return final_pdb, final_pae, fragment
     return final_pdb, final_pae
+
+
+def pick_alphafold_fragment(uniprot_id: str, cache_dir: Path,
+                            dstart: int, dend: int,
+                            local_alphafold_dir: Optional[Path] = None,
+                            allow_download: bool = True
+                            ) -> Optional[int]:
+    """Public wrapper around _pick_best_fragment.
+    Returns the AF fragment number selected by the loose-alignment / residue
+    range scan (i.e. the 'loose_align_fragment' for comparison against the
+    hardcoded 200-step / 1400-AA algorithm in step 2).
+    """
+    cache_dir = _cache_dir(cache_dir)
+    return _pick_best_fragment(uniprot_id, local_alphafold_dir, cache_dir,
+                               dstart, dend, allow_download=allow_download)
 
 
 # Backwards-compat wrapper kept so older callers still work.
@@ -709,9 +797,12 @@ def extract_chain_renumbered(pdb_path: Path, chain_id: str, cache_dir: Path,
                              notes_out: Optional[list] = None,
                              uniprot_sequence: Optional[str] = None,
                              alignment_identity_threshold: float = 0.85,
+                             restrict_to_domain: bool = True,
                              ) -> Optional[Path]:
     """Extract one chain from a PDB and renumber its residues to UniProt
-    numbering. Restricts to [dstart, dend].
+    numbering. By default restricts to [dstart, dend]; set
+    restrict_to_domain=False to keep the entire chain (used by callers that
+    need parent-protein context, e.g. fractionBuried / contactDensity).
 
     Mapping strategy
     ----------------
@@ -728,10 +819,14 @@ def extract_chain_renumbered(pdb_path: Path, chain_id: str, cache_dir: Path,
        mutations.
 
     The chosen path is recorded in notes_out for downstream auditing.
-    """
-    if out_path.exists():
-        return out_path
 
+    Cache behavior: when out_path already exists, we STILL run the
+    SIFTS/alignment determination so `notes_out` is populated with how the
+    chain was/would have been renumbered. Only the residue extraction +
+    file write are skipped. This preserves the audit trail
+    (`structureNotes` column downstream) across re-runs against a warm
+    `struct_cache/experimental/` directory.
+    """
     parser = PDB.PDBParser(QUIET=True)
     try:
         structure = parser.get_structure("s", str(pdb_path))
@@ -803,6 +898,12 @@ def extract_chain_renumbered(pdb_path: Path, chain_id: str, cache_dir: Path,
                     f"{pdb_id}/{chain_id}; cannot renumber.")
             return None
 
+    # Cache hit short-circuit: notes_out has already been populated above
+    # (SIFTS / alignment paths both append to it). Skip the residue
+    # extraction and file write — we already have the result on disk.
+    if out_path.exists():
+        return out_path
+
     # ---- Build the output structure ----------------------------------------
     new_structure = PDB.Structure.Structure("ext")
     new_model = PDB.Model.Model(0)
@@ -815,7 +916,7 @@ def extract_chain_renumbered(pdb_path: Path, chain_id: str, cache_dir: Path,
         unp_resnum = auth_to_unp.get(auth_resnum)
         if unp_resnum is None:
             continue
-        if not (dstart <= unp_resnum <= dend):
+        if restrict_to_domain and not (dstart <= unp_resnum <= dend):
             continue
         if unp_resnum in seen:
             continue
@@ -1093,12 +1194,14 @@ def resolve_domain_structure(uniprot_id: str,
 
     # Always try to get AF — needed for PAE, anchoringIndex, full-protein
     # context, and TM-validation. Picks the right fragment for long proteins.
-    af_pdb_path, pae_path = resolve_alphafold(
+    af_pdb_path, pae_path, loose_align_fragment = resolve_alphafold(
         uniprot_id, cache_dir, dstart, dend,
         local_alphafold_dir=local_alphafold_dir,
-        allow_download=allow_af_download)
+        allow_download=allow_af_download,
+        return_fragment=True)
     choice.full_protein_pdb_path = af_pdb_path
     choice.pae_path = pae_path
+    choice.loose_align_fragment = loose_align_fragment
 
     # --- Try experimental first if mode allows -----------------------------
     picked_exp = None
@@ -1114,6 +1217,17 @@ def resolve_domain_structure(uniprot_id: str,
             ext_out = (cache_dir / "experimental" /
                        f"{uniprot_id}_{pdb_id}_{chain_id}_dom_{dstart}_{dend}.pdb")
             extraction_notes: list = []
+            # Record WHY this candidate was picked from the ranked list, so
+            # structureNotes carries the full audit trail (ranking decision
+            # PLUS renumbering method).
+            res_str = (f"{cand.get('resolution'):.2f}Å"
+                       if cand.get('resolution') is not None else "n/a")
+            extraction_notes.append(
+                f"Picked {pdb_id}/{chain_id} from {len(ranked)} candidate(s) — "
+                f"purity={cand.get('domain_purity', 0):.2f}, "
+                f"coverage={cand.get('domain_coverage', 0):.2f}, "
+                f"resolution={res_str}, "
+                f"method={cand.get('method', 'unknown')}.")
             extracted = extract_chain_renumbered(
                 raw_pdb, chain_id, cache_dir, pdb_id, uniprot_id,
                 dstart, dend, ext_out,
@@ -1122,15 +1236,31 @@ def resolve_domain_structure(uniprot_id: str,
                 alignment_identity_threshold=alignment_identity_threshold)
             if extracted is None:
                 continue
-            picked_exp = (cand, extracted, extraction_notes)
+            # Also extract the FULL chain (not restricted to the domain) so
+            # downstream metrics like fractionBuried/contactDensity have parent
+            # context. Renumbered to UniProt to keep coords consistent with
+            # the domain file. Distinct filename to avoid clashing with AF.
+            full_chain_out = (cache_dir / "experimental" /
+                              f"{uniprot_id}_{pdb_id}_{chain_id}_chain.pdb")
+            # Note: notes_out=None here — the renumbering path is identical
+            # to the domain-only call above, so its notes would duplicate.
+            full_chain_extracted = extract_chain_renumbered(
+                raw_pdb, chain_id, cache_dir, pdb_id, uniprot_id,
+                dstart, dend, full_chain_out,
+                notes_out=None,
+                uniprot_sequence=uniprot_sequence,
+                alignment_identity_threshold=alignment_identity_threshold,
+                restrict_to_domain=False)
+            picked_exp = (cand, extracted, full_chain_extracted, extraction_notes)
             break  # ranked best-first; stop at first success
 
     # --- Decide what to return ---------------------------------------------
     if picked_exp is not None:
-        cand, extracted, extraction_notes = picked_exp
+        cand, extracted, full_chain_extracted, extraction_notes = picked_exp
         choice.available = True
         choice.source = "experimental"
         choice.pdb_path = extracted
+        choice.full_chain_pdb_path = full_chain_extracted
         choice.pdb_id = cand["pdb_id"]
         choice.chain_id = cand["chain_id"]
         choice.resolution = cand.get("resolution")

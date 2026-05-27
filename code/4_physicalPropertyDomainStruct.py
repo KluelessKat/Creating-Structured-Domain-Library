@@ -1,5 +1,6 @@
 import argparse
 import gzip
+import json
 import math
 import requests
 import numpy as np
@@ -7,6 +8,7 @@ import numpy as np
 import freesasa
 import pandas as pd
 import os
+from pathlib import Path
 from Bio import PDB
 from neurosnap.io.pdb import parse_pdb
 
@@ -185,10 +187,15 @@ _ap.add_argument('--output',
 _ap.add_argument('--af-dir',
                  default='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/alphaFold/dbFiles',
                  help='Directory containing domain PDB files from step 3')
+_ap.add_argument('--struct-cache-dir',
+                 default='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/struct_cache',
+                 help='Directory containing structure_source experimental PDBs (used when '
+                      'a row has a pdbID set in step 3).')
 _args = _ap.parse_args()
-input      = _args.input
-output     = _args.output
-pdbFileDir = _args.af_dir
+input        = _args.input
+output       = _args.output
+pdbFileDir   = _args.af_dir
+structCache  = Path(_args.struct_cache_dir)
 
 #Prepare a dataframe to store physical properties for domain sequences
 df=pd.read_csv(input, sep="\t")
@@ -198,41 +205,88 @@ df["aromaticSurfaceFraction"]=None
 df["positiveSurfaceFraction"]=None
 df["negativeSurfaceFraction"]=None
 
+# Per-row source flag: which PDB family the SASA calc used.
+df["structureSource"]=None
+
+HAS_HC_FRAG_COL = 'hardcoded_fragment' in df.columns
+HAS_PDB_ID_COL  = 'pdbID' in df.columns
+
+def _pdb_chain_from_structure_info(s):
+    """Extract the chain id stored in step 3's structureInfo JSON, or None."""
+    if pd.isna(s):
+        return None
+    try:
+        info = json.loads(s)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return info.get("chain")
+
 for idx, sequence in df.iterrows():#Go through each domain sequence and calculate physical properties
-    # Always resolve fragment + local coords first so the filename is domain-specific
-    proteinLength=int(sequence["Length"])
-    fragment=getAFFragment(int(sequence["Start"]), int(sequence["End"]), proteinLength)
-    if fragment is None:
-        print(f"  Skipping {sequence['Entry']}: domain spans a fragment boundary.")
-        continue
-    localStart=globalToLocal(sequence["Start"], fragment)
-    localEnd=globalToLocal(sequence["End"], fragment)
+    entry = sequence["Entry"]
+    proteinLength = int(sequence["Length"])
+    domainStart = int(sequence["Start"])
+    domainEnd   = int(sequence["End"])
 
-    pdbFile=os.path.join(pdbFileDir, f"{sequence['Entry']}_F{fragment}_{localStart}_{localEnd}_domain.pdb")
+    # ---- 1. If step 3 picked an experimental PDB, use that file ------------
+    pdbFile = None
+    if HAS_PDB_ID_COL and pd.notna(sequence.get("pdbID")):
+        pdbID = str(sequence["pdbID"])
+        chain = _pdb_chain_from_structure_info(sequence.get("structureInfo"))
+        if chain is not None:
+            candidate = (structCache / "experimental"
+                         / f"{entry}_{pdbID}_{chain}_dom_{domainStart}_{domainEnd}.pdb")
+            if candidate.exists():
+                pdbFile = str(candidate)
+                df.at[idx, "structureSource"] = "experimental"
+                print(f"Using experimental PDB for {entry} ({pdbID}/{chain}): {candidate.name}")
+            else:
+                print(f"  pdbID={pdbID} but experimental file missing at {candidate}; "
+                      f"falling back to AlphaFold.")
+        else:
+            print(f"  pdbID={pdbID} but no chain in structureInfo; falling back to AlphaFold.")
 
-    if not os.path.exists(pdbFile):
-        # Domain PDB not yet excised — fetch the AF fragment and extract it
-        print(f"Domain PDB missing for {sequence['Entry']}; fetching F{fragment} "
-              f"(protein length {proteinLength}) to extract domain "
-              f"{sequence['Start']}-{sequence['End']} (local {localStart}-{localEnd})")
-        fragmentPDB=fetchFragmentPDB(sequence["Entry"], fragment, pdbFileDir)
-        if fragmentPDB:
-            # Verify sequence before excising
-            if not verifyDomainInFragment(fragmentPDB, localStart, str(sequence["Domain Sequence"])):
-                print(f"  WARNING: Sequence mismatch for {sequence['Entry']}. "
-                      f"Check fragment/length logic. Proceeding with caution.")
-            exciseDomain(fragmentPDB, pdbFile, localStart, localEnd)
-        if not os.path.exists(pdbFile):
-            print(f"  Skipping {sequence['Entry']}: could not obtain domain PDB")
+    # ---- 2. Fall back to AlphaFold (existing logic) ------------------------
+    if pdbFile is None:
+        # Prefer the fragment column written by step 2; recompute if absent.
+        if HAS_HC_FRAG_COL and pd.notna(sequence.get("hardcoded_fragment")):
+            fragment = int(sequence["hardcoded_fragment"])
+        else:
+            fragment = getAFFragment(domainStart, domainEnd, proteinLength)
+        if fragment is None:
+            print(f"  Skipping {entry}: domain spans a fragment boundary.")
             continue
+        localStart = globalToLocal(domainStart, fragment)
+        localEnd   = globalToLocal(domainEnd,   fragment)
 
-    print(f"Calculating Physical Properties for {sequence['Entry']}")
-    metrics=calcSASAMetrics(pdbFile, 20)
-    df.at[idx, "Rg(Compactness)"]=calcRg(pdbFile)
-    df.at[idx, "surfaceFraction"]=metrics['surfaceFraction']
-    df.at[idx, "aromaticSurfaceFraction"]=metrics['aromaticFraction']
-    df.at[idx, "positiveSurfaceFraction"]=metrics['positiveFraction']
-    df.at[idx, "negativeSurfaceFraction"]=metrics['negativeFraction']
+        afCandidate = os.path.join(pdbFileDir,
+            f"{entry}_F{fragment}_{localStart}_{localEnd}_domain.pdb")
+
+        if not os.path.exists(afCandidate):
+            # Domain PDB not yet excised — fetch the AF fragment and extract it
+            print(f"Domain PDB missing for {entry}; fetching F{fragment} "
+                  f"(protein length {proteinLength}) to extract domain "
+                  f"{domainStart}-{domainEnd} (local {localStart}-{localEnd})")
+            fragmentPDB = fetchFragmentPDB(entry, fragment, pdbFileDir)
+            if fragmentPDB:
+                # Verify sequence before excising
+                if not verifyDomainInFragment(fragmentPDB, localStart,
+                                              str(sequence["Domain Sequence"])):
+                    print(f"  WARNING: Sequence mismatch for {entry}. "
+                          f"Check fragment/length logic. Proceeding with caution.")
+                exciseDomain(fragmentPDB, afCandidate, localStart, localEnd)
+            if not os.path.exists(afCandidate):
+                print(f"  Skipping {entry}: could not obtain domain PDB")
+                continue
+        pdbFile = afCandidate
+        df.at[idx, "structureSource"] = "alphafold"
+
+    print(f"Calculating Physical Properties for {entry}")
+    metrics = calcSASAMetrics(pdbFile, 20)
+    df.at[idx, "Rg(Compactness)"]         = calcRg(pdbFile)
+    df.at[idx, "surfaceFraction"]         = metrics['surfaceFraction']
+    df.at[idx, "aromaticSurfaceFraction"] = metrics['aromaticFraction']
+    df.at[idx, "positiveSurfaceFraction"] = metrics['positiveFraction']
+    df.at[idx, "negativeSurfaceFraction"] = metrics['negativeFraction']
 
 df.to_csv(output, sep='\t', index=False)
 print(f"Saved domain sequences to {output}")

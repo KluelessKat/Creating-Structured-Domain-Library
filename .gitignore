@@ -15,3 +15,10 @@ __pycache__/
 # Excel temp files (created while a file is open)
 ~$*.xlsx
 ~$*.xls
+
+# Dated pipeline run outputs (large, regenerable, run-specific)
+kat_output_library_files/0[0-9]*/
+kat_output_library_files/compare/
+
+# Log files
+*.log

@@ -216,18 +216,33 @@ if _args.sample is not None:
         print(f"Randomly sampled {_args.sample} rows from {total} total (seed=42).")
 print(f"Imaging {len(df)} domain(s).")
 
+# If step 2 wrote a hardcoded_fragment column we can read it directly and skip
+# the (cheap-but-redundant) recompute. Keep the fallback so step 6 still works
+# when run on TSVs produced before that column existed.
+_HAS_HC_FRAG_COL = 'hardcoded_fragment' in df.columns
+_GROUP_COLS = ['Domain', 'Domain Sequence', 'Start', 'End', 'Length']
+if _HAS_HC_FRAG_COL:
+    _GROUP_COLS.append('hardcoded_fragment')
+
 entriesDictionary={}
 for entry, group in df.groupby('Entry'):#Record relevant info for each domain sequence to help create annotations
-    entriesDictionary[entry]=group[['Domain', 'Domain Sequence', 'Start', 'End', 'Length']].values.tolist()
+    entriesDictionary[entry]=group[_GROUP_COLS].values.tolist()
 
 imagePaths=[]
 annotations=[]
 for entry, rows in entriesDictionary.items():#Go through each protein
     for row in rows: #Go through each domain of a protein
-        domain, domainSeq, start, end, length = row
+        if _HAS_HC_FRAG_COL:
+            domain, domainSeq, start, end, length, hardcoded_fragment = row
+        else:
+            domain, domainSeq, start, end, length = row
+            hardcoded_fragment = None
 
-        # Determine fragment and convert to local coords using protein length
-        fragment=getAFFragment(int(start), int(end), int(length))
+        # Prefer the column written by step 2; fall back to recomputing.
+        if hardcoded_fragment is not None and pd.notna(hardcoded_fragment):
+            fragment = int(hardcoded_fragment)
+        else:
+            fragment = getAFFragment(int(start), int(end), int(length))
         if fragment is None:
             print(f"  Skipping {entry} domain {start}-{end}: spans a fragment boundary.")
             continue
