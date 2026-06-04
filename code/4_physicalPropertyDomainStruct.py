@@ -191,11 +191,20 @@ _ap.add_argument('--struct-cache-dir',
                  default='/Users/katherinezhang/Downloads/Kappel_2026SpringRotation/Creating-Structured-Domain-Library/struct_cache',
                  help='Directory containing structure_source experimental PDBs (used when '
                       'a row has a pdbID set in step 3).')
+_ap.add_argument('--ignore-pdbid', action='store_true',
+                 help='Force SASA calculation from the AlphaFold PDB even when '
+                      'the row has a pdbID set. Useful for full-protein runs '
+                      'where the experimental PDB is only a partial chain and '
+                      'using it would mix incomparable scopes (partial-chain '
+                      'SASA vs full-protein AF SASA) across rows.')
 _args = _ap.parse_args()
 input        = _args.input
 output       = _args.output
 pdbFileDir   = _args.af_dir
 structCache  = Path(_args.struct_cache_dir)
+ignorePdbid  = _args.ignore_pdbid
+if ignorePdbid:
+    print("--ignore-pdbid set: all rows will use AF PDBs regardless of pdbID.")
 
 #Prepare a dataframe to store physical properties for domain sequences
 df=pd.read_csv(input, sep="\t")
@@ -228,8 +237,11 @@ for idx, sequence in df.iterrows():#Go through each domain sequence and calculat
     domainEnd   = int(sequence["End"])
 
     # ---- 1. If step 3 picked an experimental PDB, use that file ------------
+    # Suppressed by --ignore-pdbid (used for full-protein runs where
+    # mixing partial-chain exp SASA with full-protein AF SASA across rows
+    # would produce incomparable values).
     pdbFile = None
-    if HAS_PDB_ID_COL and pd.notna(sequence.get("pdbID")):
+    if not ignorePdbid and HAS_PDB_ID_COL and pd.notna(sequence.get("pdbID")):
         pdbID = str(sequence["pdbID"])
         chain = _pdb_chain_from_structure_info(sequence.get("structureInfo"))
         if chain is not None:

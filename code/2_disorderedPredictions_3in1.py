@@ -249,11 +249,17 @@ def _fetch_plddt_for_fragment(uniprot_id: str, fragment: int,
     # --- 1. Check local af_dir first ----------------------------------------
     if af_dir and af_dir.is_dir():
         candidates: list[Path] = []
-        if fragment == 1:                          # step-3 naming convention
+        # Step-3 / current pipeline naming convention (fragment-aware):
+        candidates += [
+            af_dir / f"{uniprot_id}_F{fragment}_model.pdb",
+            af_dir / f"{uniprot_id}_F{fragment}_model.pdb.gz",
+        ]
+        if fragment == 1:                          # legacy step-3 naming
             candidates += [
                 af_dir / f"{uniprot_id}_model.pdb",
                 af_dir / f"{uniprot_id}_model.pdb.gz",
             ]
+        # Original AlphaFold DB naming:
         candidates += [
             af_dir / f"AF-{uniprot_id}-F{fragment}-model_v6.pdb",
             af_dir / f"AF-{uniprot_id}-F{fragment}-model_v6.pdb.gz",

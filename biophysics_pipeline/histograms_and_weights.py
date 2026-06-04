@@ -45,6 +45,7 @@ NOTES
 from __future__ import annotations
 import argparse
 import os
+import sys
 import warnings
 import numpy as np
 import pandas as pd
@@ -121,14 +122,43 @@ def seq_properties(seq):
 # ===========================================================================
 
 def load_inputs(proteome_path, domains_path, candidates_path=None):
+    """Load the three input TSVs.
+
+    The --proteome file may contain either a 'Sequence' column (full
+    protein sequences, the usual case) OR a 'Domain Sequence' column
+    (domain-level data, useful when you want to compare two domain
+    libraries against each other instead of full-proteome background).
+    Whichever is present is normalised to 'Sequence' internally so the
+    rest of the script doesn't need to know which file type was passed.
+
+    The --domains file MUST have a 'Domain Sequence' column (downstream
+    family / candidate analyses depend on domain-level data).
+    """
     print(f"Loading proteome: {proteome_path}")
     prot = pd.read_csv(proteome_path, sep="\t")
+    if "Sequence" in prot.columns:
+        seq_col = "Sequence"
+    elif "Domain Sequence" in prot.columns:
+        seq_col = "Domain Sequence"
+        prot = prot.rename(columns={"Domain Sequence": "Sequence"})
+        print(f"  NOTE: --proteome file has no 'Sequence' column; using "
+              f"'Domain Sequence' as the background distribution.\n"
+              f"        Section A's 'full proteome' line is effectively a "
+              f"domain-vs-domain comparison.")
+    else:
+        sys.exit(f"ERROR: --proteome file '{proteome_path}' has neither "
+                 f"'Sequence' nor 'Domain Sequence'. Available columns: "
+                 f"{list(prot.columns)}")
     prot = prot.dropna(subset=["Sequence"]).copy()
     prot["Sequence"] = prot["Sequence"].astype(str)
-    print(f"  {len(prot)} proteins")
+    print(f"  {len(prot)} sequences (from column '{seq_col}')")
 
     print(f"Loading domains: {domains_path}")
     dom = pd.read_csv(domains_path, sep="\t")
+    if "Domain Sequence" not in dom.columns:
+        sys.exit(f"ERROR: --domains file '{domains_path}' has no "
+                 f"'Domain Sequence' column. Available columns: "
+                 f"{list(dom.columns)}")
     dom = dom.dropna(subset=["Domain Sequence"]).copy()
     dom["Domain Sequence"] = dom["Domain Sequence"].astype(str)
     print(f"  {len(dom)} domains, {dom['Domain'].nunique()} unique families")
@@ -147,6 +177,48 @@ def add_seq_properties(df, seq_col):
     rows = [seq_properties(s) for s in df[seq_col]]
     feats = pd.DataFrame(rows, index=df.index)
     return pd.concat([df, feats], axis=1)
+
+
+# Step 3 now writes two parallel sets of structural-context metrics:
+#   `fractionBuried`     / `exp_fractionBuried`
+#   `contactDensity`     / `exp_contactDensity`
+#   `interactionIndex`   / `exp_interactionIndex`
+# The AF (`_*`) version is always present; the experimental (`exp_*`) version
+# is populated only when structure_source picked an experimental PDB AND
+# `highPurityFlag` was False. We build a `<metric>_best` column that prefers
+# the experimental value when available and falls back to AF otherwise.
+# Plots and downstream feature lists use `_best`; the original columns
+# survive in the dataframe for diagnostic / per-source comparisons.
+BEST_METRIC_PAIRS = [
+    ("fractionBuried",   "exp_fractionBuried"),
+    ("contactDensity",   "exp_contactDensity"),
+    ("interactionIndex", "exp_interactionIndex"),
+]
+
+
+def add_best_context_metrics(df):
+    """For each (af, exp) pair, create `{af}_best` = exp where present, else af.
+    Also records `{af}_best_source` ('exp' / 'af') for per-row provenance."""
+    for af_col, exp_col in BEST_METRIC_PAIRS:
+        if af_col not in df.columns:
+            continue
+        af_vals = pd.to_numeric(df[af_col], errors="coerce")
+        if exp_col in df.columns:
+            exp_vals = pd.to_numeric(df[exp_col], errors="coerce")
+            df[f"{af_col}_best"]        = exp_vals.fillna(af_vals)
+            df[f"{af_col}_best_source"] = np.where(
+                exp_vals.notna(), "exp", np.where(af_vals.notna(), "af", "none"))
+            n_exp  = int(exp_vals.notna().sum())
+            n_af   = int((af_vals.notna() & ~exp_vals.notna()).sum())
+            n_none = int((af_vals.isna()  &  exp_vals.isna()).sum())
+            print(f"  {af_col}_best: {n_exp:,} rows from experimental, "
+                  f"{n_af:,} rows from AF fallback, "
+                  f"{n_none:,} rows with neither.")
+        else:
+            # No experimental column at all — _best collapses to AF.
+            df[f"{af_col}_best"]        = af_vals
+            df[f"{af_col}_best_source"] = np.where(af_vals.notna(), "af", "none")
+    return df
 
 
 # ===========================================================================
@@ -216,40 +288,81 @@ SURFACE_PROPS = ["surfaceFraction","aromaticSurfaceFraction",
                  "Rg(Compactness)"]
 
 # Structural-context metrics (domains only).
-CONTEXT_PROPS = ["anchoringIndex","fractionBuried","contactDensity",
-                 "interactionIndex","meanDomainplddt"]
+# Uses `_best` columns (built by add_best_context_metrics) which prefer the
+# experimental PDB value over the AF value where both exist. anchoringIndex
+# stays AF-only (no experimental equivalent — derived from AF PAE matrix).
+CONTEXT_PROPS = ["anchoringIndex",
+                 "fractionBuried_best",
+                 "contactDensity_best",
+                 "interactionIndex_best",
+                 "meanDomainplddt"]
+
+
+def _plot_single_distribution(ax, values, prop, label, color):
+    """Helper: plot a single-distribution histogram on `ax`."""
+    lo, hi = np.nanpercentile(values, [0.5, 99.5])
+    if lo == hi: lo, hi = values.min(), values.max() + 1e-9
+    bins = np.linspace(lo, hi, 50)
+    ax.hist(values, bins=bins, weights=np.full(len(values), 100.0/len(values)),
+            alpha=0.6, color=color, label=f"{label} (n={len(values)})")
+    ax.axvline(values.median(), color=color, ls="--", lw=1.3)
+    ax.set_title(prop + f"  ({label} only)", fontsize=10)
+    ax.set_ylabel("% of population")
+    ax.tick_params(labelsize=8)
 
 
 def section_A_proteome_vs_domains(prot, dom, outdir):
-    """Full-proteome composition vs domain library composition + domain-only
-    surface / structural panels."""
+    """Compare full-proteome vs domain library across every property
+    available. The plot is data-driven: for each property, plot
+    dual-distribution when both files have it populated, fall back to
+    single-distribution from whichever file does, or skip the panel."""
     print("\n--- Section A: full proteome vs all structured domains ---")
-    props = COMP_PROPS + SURFACE_PROPS + ["interactionIndex"]
+    # Use `_best` versions for the three exp/AF-paired metrics so the plot
+    # reflects the highest-quality value per row (experimental PDB where
+    # available, AF fallback otherwise).
+    props = COMP_PROPS + SURFACE_PROPS + [
+        "fractionBuried_best", "contactDensity_best", "interactionIndex_best"]
 
     n = len(props); ncols = 5; nrows = int(np.ceil(n/ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(4*ncols, 3*nrows))
     axes = axes.flatten()
 
+    skipped: list[str] = []
+    n_dual = n_prot_only = n_dom_only = 0
     for ax, prop in zip(axes, props):
-        if prop in COMP_PROPS:
-            a = prot[prop]; b = dom[prop]
+        # Extract numeric values from each side; an empty Series means
+        # "column missing or all-NaN".
+        a = (pd.to_numeric(prot[prop], errors="coerce").dropna()
+             if prop in prot.columns else pd.Series(dtype=float))
+        b = (pd.to_numeric(dom[prop], errors="coerce").dropna()
+             if prop in dom.columns else pd.Series(dtype=float))
+
+        if len(a) == 0 and len(b) == 0:
+            ax.set_visible(False)
+            skipped.append(prop)
+            continue
+
+        if len(a) > 0 and len(b) > 0:
+            # Both sides have data → dual-distribution overlay.
             _hist_panel(ax, a, b, "full proteins", "domains", prop)
+            n_dual += 1
+        elif len(b) > 0:
+            # Only domains have data (the common case for surface/context
+            # metrics when step 4 wasn't run on the proteome side).
+            _plot_single_distribution(ax, b, prop, "domains", "#DD8452")
+            n_dom_only += 1
         else:
-            # surface metrics — domain-only, plot as single distribution
-            b = dom[prop]
-            b = pd.to_numeric(b, errors="coerce").dropna()
-            if len(b) == 0:
-                ax.set_visible(False); continue
-            lo, hi = np.nanpercentile(b, [0.5, 99.5])
-            if lo == hi: lo, hi = b.min(), b.max()+1e-9
-            bins = np.linspace(lo, hi, 50)
-            ax.hist(b, bins=bins, weights=np.full(len(b), 100.0/len(b)),
-                    alpha=0.6, color="#DD8452",
-                    label=f"domains (n={len(b)})")
-            ax.axvline(b.median(), color="#DD8452", ls="--", lw=1.3)
-            ax.set_title(prop + "  (domains only)", fontsize=10)
-            ax.set_ylabel("% of population")
-            ax.tick_params(labelsize=8)
+            # Only proteome has data (rare — would only happen if you
+            # pointed the script at very different inputs).
+            _plot_single_distribution(ax, a, prop, "full proteins", "#4C72B0")
+            n_prot_only += 1
+
+    if skipped:
+        print(f"  Section A: skipped {len(skipped)} props (column missing "
+              f"or all-NaN in both inputs): {skipped}")
+    print(f"  Section A: {n_dual} dual-distribution, "
+          f"{n_dom_only} domains-only, "
+          f"{n_prot_only} proteome-only panels.")
 
     for ax in axes[n:]:
         ax.set_visible(False)
@@ -257,14 +370,81 @@ def section_A_proteome_vs_domains(prot, dom, outdir):
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=2,
                bbox_to_anchor=(0.5, -0.01))
-    fig.suptitle("Section A — full human proteome vs all structured domains\n"
-                 "(blue = proteome, orange = domains; surface metrics are "
-                 "domain-only because they require structures)",
+    fig.suptitle("Section A — full proteome vs all structured domains\n"
+                 "(blue = proteome, orange = domains; panels labeled "
+                 "'… only' have data on just one side)",
                  fontsize=12, y=1.0)
     fig.tight_layout(rect=[0, 0.02, 1, 0.97])
     out = os.path.join(outdir, "A_proteome_vs_domains.png")
     fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"  wrote {out}")
+
+# ===========================================================================
+#  Section A2: AF vs experimental PDB metrics (diagnostic)
+# ===========================================================================
+
+def section_A2_af_vs_exp(dom, outdir):
+    """For domains where BOTH AF and experimental metrics exist, overlay the
+    two distributions per metric. This is a diagnostic — it tells you
+    whether prioritizing exp_* over AF in `_best` columns actually changes
+    the picture, and where the two diverge."""
+    print("\n--- Section A2: AF vs experimental PDB context metrics ---")
+    pairs = [(af, exp) for af, exp in BEST_METRIC_PAIRS
+             if af in dom.columns and exp in dom.columns]
+    if not pairs:
+        print("  no AF/exp pairs found — skipping")
+        return
+
+    # Only consider rows that have BOTH values (so the comparison is paired).
+    paired_mask = pd.Series([True] * len(dom), index=dom.index)
+    for af, exp in pairs:
+        paired_mask &= pd.to_numeric(dom[af], errors="coerce").notna()
+        paired_mask &= pd.to_numeric(dom[exp], errors="coerce").notna()
+    n_paired = int(paired_mask.sum())
+    if n_paired < 5:
+        print(f"  only {n_paired} rows have both AF and exp values — skipping")
+        return
+    paired = dom.loc[paired_mask]
+
+    n = len(pairs); ncols = min(3, n); nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.5 * ncols, 3.5 * nrows),
+                             squeeze=False)
+    axes = axes.flatten()
+    for ax, (af, exp) in zip(axes, pairs):
+        a = pd.to_numeric(paired[af], errors="coerce")
+        b = pd.to_numeric(paired[exp], errors="coerce")
+        _hist_panel(ax, a, b, "AF", "experimental",
+                    af.replace("_best", ""),
+                    color_a="#4C72B0", color_b="#C44E52")
+
+    for ax in axes[len(pairs):]:
+        ax.set_visible(False)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=2,
+               bbox_to_anchor=(0.5, -0.02))
+    fig.suptitle(
+        f"Section A2 — AF vs experimental PDB metrics  (paired: n={n_paired})\n"
+        "Subset of domains where both AF and experimental values were computed.\n"
+        "Cohen's d > 0 means experimental values are higher on average than AF.",
+        fontsize=12, y=1.0)
+    fig.tight_layout(rect=[0, 0.02, 1, 0.96])
+    out = os.path.join(outdir, "A2_af_vs_exp.png")
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out}")
+
+    # Also write a paired-difference table for the rotation write-up.
+    diffs = pd.DataFrame({
+        af.replace("_best", "") + "_exp_minus_af":
+            pd.to_numeric(paired[exp], errors="coerce")
+            - pd.to_numeric(paired[af], errors="coerce")
+        for af, exp in pairs
+    })
+    out_tsv = os.path.join(outdir, "A2_af_vs_exp_paired_differences.tsv")
+    diffs.describe().to_csv(out_tsv, sep="\t")
+    print(f"  wrote {out_tsv}")
+
 
 # ===========================================================================
 #  Section B helpers — Rg normalization, sequence variability, patterning
@@ -588,7 +768,8 @@ def section_B_by_family(dom, outdir, min_family_size=10):
  
     # ---- B.1: standard properties -----------------------------------------
     print("  B.1: standard property violins ...")
-    props_b1 = COMP_PROPS + SURFACE_PROPS + ["interactionIndex"]
+    # interactionIndex_best uses the experimental PDB value where available.
+    props_b1 = COMP_PROPS + SURFACE_PROPS + ["interactionIndex_best"]
     for prop in props_b1:
         if prop not in dom.columns:
             continue
@@ -958,6 +1139,17 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
     prot, dom, cand = load_inputs(args.proteome, args.domains, args.candidates)
 
+    # Build `*_best` columns that prefer experimental PDB metrics over AF
+    # ones (step 3 now writes both). All downstream plots reference these
+    # *_best columns via CONTEXT_PROPS. Applied to BOTH frames so Section A
+    # can plot dual distributions when --proteome also has the columns
+    # (e.g. when comparing two step-3 outputs against each other).
+    print("\nBuilding *_best context metrics for proteome side "
+          "(exp_* preferred, AF fallback) ...")
+    prot = add_best_context_metrics(prot)
+    print("Building *_best context metrics for domain side ...")
+    dom = add_best_context_metrics(dom)
+
     # Compute composition properties for both groups
     print("\nComputing composition properties for full proteome ...")
     prot = add_seq_properties(prot, "Sequence")
@@ -965,6 +1157,7 @@ def main():
     dom = add_seq_properties(dom, "Domain Sequence")
 
     section_A_proteome_vs_domains(prot, dom, args.outdir)
+    section_A2_af_vs_exp(dom, args.outdir)
     section_B_by_family(dom, args.outdir, min_family_size=args.min_family_size)
     if cand is not None:
         section_C_candidates(dom, cand, args.outdir)

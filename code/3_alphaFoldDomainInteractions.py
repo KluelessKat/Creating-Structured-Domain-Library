@@ -8,6 +8,11 @@ import json
 from pathlib import Path
 import numpy as np
 import freesasa
+# Silence FreeSASA's per-atom warnings about UNK / modified residues.
+# These are informational ("guessing radius for unknown atom") and would
+# otherwise flood the log with thousands of lines for experimental PDBs
+# that contain UNK backbones or non-standard residues. Errors still print.
+freesasa.setVerbosity(freesasa.nowarnings)
 from Bio import PDB
 from scipy.spatial.distance import cdist
 import pandas as pd
@@ -251,8 +256,8 @@ def contactDensity(pdbFile, domainStart, domainEnd):
             if np.any(cdist(domainCoordinates, otherCoordinates) < cutoff):
                 totalContacts+=1
 
-    return totalContacts/(len(domainResidues)*len(otherResidues))
-    #return totalContacts/len(domainResidues)
+    #return totalContacts/(len(domainResidues)*len(otherResidues))
+    return totalContacts/len(domainResidues)
 
 def plddtMean(domainPDBFile):
     '''Returns the mean pLDDT (B-factor) of all residues in the domain PDB.'''
