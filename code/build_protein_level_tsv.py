@@ -34,6 +34,7 @@ USAGE
 from __future__ import annotations
 import argparse
 import sys
+from pathlib import Path
 import pandas as pd
 
 
@@ -98,9 +99,12 @@ def main():
         "Domain Length":   df["Length"],
         "Domain Sequence": df["Sequence"],
     })
-    out.to_csv(args.output_tsv, sep="\t", index=False)
+    # Ensure the output directory exists so the to_csv open() doesn't fail.
+    out_path = Path(args.output_tsv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(out_path, sep="\t", index=False)
 
-    print(f"\nWrote {args.output_tsv}")
+    print(f"\nWrote {out_path}")
     print(f"  {len(out):,} protein-level 'domain' rows.")
     if args.max_length and args.max_length > 0:
         print(f"  All proteins ≤ {args.max_length} AA.")

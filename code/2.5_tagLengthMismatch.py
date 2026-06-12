@@ -39,6 +39,7 @@ Usage
 from __future__ import annotations
 import argparse
 import sys
+from pathlib import Path
 import pandas as pd
 
 
@@ -99,7 +100,9 @@ def main():
            "af_mismatch_reason"] = "not_in_audit"
     not_audited = int((df["af_mismatch_reason"] == "not_in_audit").sum())
 
-    df.to_csv(args.output_tsv, sep="\t", index=False)
+    out_path = Path(args.output_tsv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_path, sep="\t", index=False)
 
     # Summary.
     n      = len(df)

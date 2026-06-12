@@ -42,6 +42,7 @@ disable the filter and accept all species.
 from __future__ import annotations
 import argparse
 import sys
+from pathlib import Path
 import pandas as pd
 
 
@@ -120,7 +121,9 @@ def main():
     merged["synthetic"]       = merged["synthetic"].astype("Int64")
     merged["phasepro_in_db"]  = merged["phasepro_in_db"].fillna(False).astype(bool)
 
-    merged.to_csv(args.output_tsv, sep="\t", index=False)
+    out_path = Path(args.output_tsv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    merged.to_csv(out_path, sep="\t", index=False)
     print(f"\nWrote {args.output_tsv}")
     print(f"  total rows:                          {len(merged):,}")
 
