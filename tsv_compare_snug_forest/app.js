@@ -594,9 +594,197 @@
     return el;
   }
 
+  // ---------- Report export ----------
+  function buildReportHtml() {
+    const beforeName = sides.before.file ? sides.before.file.name : 'before';
+    const afterName  = sides.after.file  ? sides.after.file.name  : 'after';
+    const now = new Date().toLocaleString();
+
+    // Summary stats
+    const nGenesBefore = analysis.before.genes.size;
+    const nGenesAfter  = analysis.after.genes.size;
+    const genesAdded   = analysis.q1.onlyAfter.length;
+    const genesRemoved = analysis.q1.onlyBefore.length;
+
+    let instancesBefore = 0;
+    for (const entries of analysis.before.geneDomainEntries.values()) instancesBefore += entries.length;
+    let instancesAfter = 0;
+    for (const entries of analysis.after.geneDomainEntries.values()) instancesAfter += entries.length;
+    const instancesDelta = instancesAfter - instancesBefore;
+
+    // Top 10 domains by absolute delta
+    const top10 = Array.from(analysis.q2b.entries())
+      .map(([domain, c]) => ({ domain, before: c.before, after: c.after, delta: c.after - c.before }))
+      .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
+      .slice(0, 10);
+
+    // Full domain table sorted by |delta|
+    const q2bFull = Array.from(analysis.q2b.entries())
+      .map(([domain, c]) => ({ domain, before: c.before, after: c.after, delta: c.after - c.before }))
+      .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+
+    // Sorted gene/tuple lists
+    const q1Before = [...analysis.q1.onlyBefore].sort((a, b) => a.localeCompare(b));
+    const q1Both   = [...analysis.q1.both].sort((a, b) => a.localeCompare(b));
+    const q1After  = [...analysis.q1.onlyAfter].sort((a, b) => a.localeCompare(b));
+    const tupleSort = (a, b) => a.domain.localeCompare(b.domain) || a.gene.localeCompare(b.gene);
+    const q2aBefore = [...analysis.q2a.onlyBefore].sort(tupleSort);
+    const q2aBoth   = [...analysis.q2a.both].sort(tupleSort);
+    const q2aAfter  = [...analysis.q2a.onlyAfter].sort(tupleSort);
+
+    function dSign(d) {
+      if (d > 0) return `<span style="color:#4a8a4a;font-weight:700">+${d}</span>`;
+      if (d < 0) return `<span style="color:#b1564a;font-weight:700">${d}</span>`;
+      return `<span style="color:#6b6b6b">0</span>`;
+    }
+    function geneItems(arr) {
+      if (!arr.length) return '<li style="color:#6b6b6b;font-style:italic;padding:16px 12px;text-align:center">none</li>';
+      return arr.map((g) => `<li>${escapeHtml(g)}</li>`).join('');
+    }
+    function tupleItems(arr) {
+      if (!arr.length) return '<li style="color:#6b6b6b;font-style:italic;padding:16px 12px;text-align:center">none</li>';
+      return arr.map((it) => {
+        const pos = (it.start != null && it.end != null && !Number.isNaN(it.start) && !Number.isNaN(it.end))
+          ? `${it.start}–${it.end}` : '—';
+        return `<li><strong>${escapeHtml(it.domain)}</strong> · ${escapeHtml(it.gene)} · <span style="color:#6b6b6b;font-size:11px">${escapeHtml(pos)}</span></li>`;
+      }).join('');
+    }
+    function domainRows(arr) {
+      return arr.map((d) => `<tr><td>${escapeHtml(d.domain)}</td><td>${d.before}</td><td>${d.after}</td><td>${dSign(d.delta)}</td></tr>`).join('');
+    }
+
+    // Serialize the live SVG chart
+    const svgEl = document.getElementById('q2b-bars');
+    const svgHtml = svgEl ? new XMLSerializer().serializeToString(svgEl) : '';
+
+    const triColStyle = 'background:#fcfaf0;border-radius:8px;border:1px solid rgba(94,122,94,0.18);overflow:hidden;';
+    const headStyle = 'padding:10px 12px 8px;border-bottom:1px solid rgba(94,122,94,0.18);background:#fffdf5;';
+    const h3Style = 'margin:0 0 0;font-size:14px;font-weight:700;color:#5e7a5e;';
+    const countStyle = 'font-size:11px;color:#6b6b6b;background:#f5ecd6;border-radius:999px;padding:2px 8px;font-weight:600;margin-left:6px;';
+    const listStyle = 'list-style:none;margin:0;padding:4px 0;max-height:420px;overflow:auto;';
+    const listItemStyle = 'padding:5px 12px;font-size:12px;border-bottom:1px dashed rgba(94,122,94,0.10);word-break:break-word;';
+    const thStyle = 'text-align:left;color:#6b6b6b;font-weight:600;border-bottom:1px solid rgba(94,122,94,0.18);padding:6px 10px;';
+    const tdStyle = 'padding:6px 10px;border-bottom:1px solid rgba(94,122,94,0.08);';
+
+    function triCol(stripeColor, title, count, listInner) {
+      return `<div style="${triColStyle}">
+        <div style="height:4px;background:${stripeColor}"></div>
+        <div style="${headStyle}"><h3 style="${h3Style}">${title} <span style="${countStyle}">${count.toLocaleString()}</span></h3></div>
+        <ul style="${listStyle}">${listInner}</ul>
+      </div>`;
+    }
+
+    const geneDelta = nGenesAfter - nGenesBefore;
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Snug Forest Report · ${escapeHtml(beforeName)} vs ${escapeHtml(afterName)}</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;background:#fbf6e7;color:#2a2a2a;margin:0;padding:0;font-size:14px;font-weight:500}
+.wrap{max-width:1100px;margin:0 auto;padding:40px 28px 60px}
+h1{color:#5e7a5e;font-size:26px;margin:0 0 4px}
+h2{color:#5e7a5e;font-size:18px;margin:0 0 14px}
+.meta-line{color:#6b6b6b;font-size:13px;margin:0 0 32px}
+.card{background:#fff;border-radius:12px;padding:22px;box-shadow:0 4px 18px rgba(60,80,50,0.08);border:1px solid rgba(94,122,94,0.18);margin-bottom:32px}
+.stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:24px}
+.stat-cell{background:#fcfaf0;border-radius:8px;padding:14px 16px;border:1px solid rgba(94,122,94,0.18)}
+.stat-label{font-size:12px;color:#6b6b6b;margin-bottom:4px}
+.stat-value{font-size:22px;font-weight:700;color:#5e7a5e}
+.stat-sub{font-size:12px;color:#6b6b6b;margin-top:2px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+.tri-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+.bar-svg{display:block;width:100%;overflow:visible}
+.bar-svg .axis-label{fill:#6b6b6b;font-size:11px;font-family:-apple-system,sans-serif}
+.bar-svg .domain-label{fill:#2a2a2a;font-size:12px;font-family:-apple-system,sans-serif;font-weight:600}
+.bar-svg .value-label{fill:#2a2a2a;font-size:11px;font-family:-apple-system,sans-serif;font-weight:600}
+.bar-svg .row-bg{fill:rgba(245,236,214,0.45)}
+.bar-svg .grid-line{stroke:rgba(94,122,94,0.15);stroke-width:1}
+.bar-svg .bar-before{fill:#8faf85}
+.bar-svg .bar-after{fill:#a8c5d8}
+@media(max-width:700px){.tri-grid{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Snug Forest · Comparison Report</h1>
+  <p class="meta-line">Generated ${escapeHtml(now)} &nbsp;·&nbsp; Before: <strong>${escapeHtml(beforeName)}</strong> &nbsp;·&nbsp; After: <strong>${escapeHtml(afterName)}</strong></p>
+
+  <div class="card">
+    <h2>Summary</h2>
+    <div class="stat-grid">
+      <div class="stat-cell"><div class="stat-label">Unique genes · Before</div><div class="stat-value">${nGenesBefore.toLocaleString()}</div></div>
+      <div class="stat-cell"><div class="stat-label">Unique genes · After</div><div class="stat-value">${nGenesAfter.toLocaleString()}</div></div>
+      <div class="stat-cell">
+        <div class="stat-label">Gene delta</div>
+        <div class="stat-value">${geneDelta >= 0 ? '+' : ''}${geneDelta.toLocaleString()}</div>
+        <div class="stat-sub">+${genesAdded} added &nbsp;·&nbsp; −${genesRemoved} removed</div>
+      </div>
+      <div class="stat-cell"><div class="stat-label">Domain instances · Before</div><div class="stat-value">${instancesBefore.toLocaleString()}</div></div>
+      <div class="stat-cell"><div class="stat-label">Domain instances · After</div><div class="stat-value">${instancesAfter.toLocaleString()}</div></div>
+      <div class="stat-cell"><div class="stat-label">Instance delta</div><div class="stat-value">${instancesDelta >= 0 ? '+' : ''}${instancesDelta.toLocaleString()}</div></div>
+    </div>
+    <h2 style="font-size:15px;margin-bottom:10px">Top 10 domains by absolute change</h2>
+    <table>
+      <thead><tr><th style="${thStyle}">Domain</th><th style="${thStyle}">Before</th><th style="${thStyle}">After</th><th style="${thStyle}">Delta</th></tr></thead>
+      <tbody>${domainRows(top10)}</tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>1. Genes added &amp; removed</h2>
+    <div class="tri-grid">
+      ${triCol('#d8c9a8', 'Only in Before', q1Before.length, geneItems(q1Before))}
+      ${triCol('#8faf85', 'In Both', q1Both.length, geneItems(q1Both))}
+      ${triCol('#a8c5d8', 'Only in After', q1After.length, geneItems(q1After))}
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>2a. Domain instances added &amp; removed</h2>
+    <div class="tri-grid">
+      ${triCol('#d8c9a8', 'Only in Before', q2aBefore.length, tupleItems(q2aBefore))}
+      ${triCol('#8faf85', 'In Both', q2aBoth.length, tupleItems(q2aBoth))}
+      ${triCol('#a8c5d8', 'Only in After', q2aAfter.length, tupleItems(q2aAfter))}
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>2b. Domain count comparison</h2>
+    ${svgHtml}
+    <h2 style="font-size:15px;margin:24px 0 10px">All domain counts (sorted by |delta|)</h2>
+    <table>
+      <thead><tr><th style="${thStyle}">Domain</th><th style="${thStyle}">Before</th><th style="${thStyle}">After</th><th style="${thStyle}">Delta</th></tr></thead>
+      <tbody>${domainRows(q2bFull)}</tbody>
+    </table>
+  </div>
+</div>
+</body>
+</html>`;
+  }
+
+  function downloadReport() {
+    const html = buildReportHtml();
+    const blob = new Blob([html], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `snug-forest-report-${new Date().toISOString().slice(0, 10)}.html`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
   // ---------- Wire-up ----------
   function init() {
     document.querySelectorAll('.dropzone').forEach(setupDropzone);
+
+    document.getElementById('export-btn').disabled = true;
+    document.getElementById('export-btn').addEventListener('click', downloadReport);
 
     document.getElementById('analyze-btn').addEventListener('click', () => {
       runAnalysis();
@@ -622,6 +810,7 @@
       renderQ2a();
       renderQ2b();
       document.getElementById('results').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      document.getElementById('export-btn').disabled = false;
     });
 
     // Q1 grid: per-column search, filter toggles
